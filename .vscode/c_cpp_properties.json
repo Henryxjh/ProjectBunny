@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "Win64",
+            "includePath": [
+                "${workspaceFolder}",
+                "${workspaceFolder}\\BinaryDecompiler",
+                "${workspaceFolder}\\BinaryDecompiler\\include"
+            ],
+            "defines": [
+                "WIN32",
+                "NDEBUG",
+                "_CONSOLE",
+                "_LIB",
+                "_UNICODE",
+                "UNICODE"
+            ],
+            "compilerPath": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "windows-msvc-x64",
+            "configurationProvider": "ms-vscpp.ms-vscpp-tools"
+        }
+    ],
+    "version": 4
+}
