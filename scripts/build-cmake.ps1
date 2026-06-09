@@ -78,5 +78,16 @@ foreach ($f in $files) {
     }
 }
 
+if ($Platform -eq 'x64') {
+    $dx12TestDir = "D:\Softs\Steam\steamapps\common\Slay the Spire 2"
+    $dx12Dll = "$outDir\d3d12.dll"
+    if ((Test-Path $dx12Dll) -and (Test-Path $dx12TestDir)) {
+        Copy-Item $dx12Dll "$dx12TestDir\d3d12.dll" -Force
+        Write-Host "  Copied DX12 test DLL: $dx12TestDir\d3d12.dll" -ForegroundColor Gray
+    } elseif (-not (Test-Path $dx12TestDir)) {
+        Write-Host "  Skipped DX12 test DLL copy: directory not found: $dx12TestDir" -ForegroundColor Yellow
+    }
+}
+
 Write-Host "`n===== All projects built successfully =====" -ForegroundColor Green
 Write-Host "Output directory: $outDir"

@@ -3,6 +3,9 @@
 # ============================================================
 add_library(DirectX12 SHARED
     D3D12Wrapper.cpp
+    DX12Overlay.cpp
+    DX12State.cpp
+    DXGIHooks.cpp
 )
 
 target_include_directories(DirectX12 PRIVATE
