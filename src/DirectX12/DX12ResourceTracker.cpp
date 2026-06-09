@@ -43,6 +43,32 @@ typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_PLACED_RESOURCE)(
 typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_RESERVED_RESOURCE)(
 	ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
 	const D3D12_CLEAR_VALUE*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_COMMITTED_RESOURCE1)(
+	ID3D12Device4*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+	const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+	ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_RESERVED_RESOURCE1)(
+	ID3D12Device4*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+	const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_COMMITTED_RESOURCE2)(
+	ID3D12Device8*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+	const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+	ID3D12ProtectedResourceSession*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_PLACED_RESOURCE1)(
+	ID3D12Device8*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*,
+	D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_COMMITTED_RESOURCE3)(
+	ID3D12Device10*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+	const D3D12_RESOURCE_DESC1*, D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*,
+	ID3D12ProtectedResourceSession*, UINT32, const DXGI_FORMAT*, REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_PLACED_RESOURCE2)(
+	ID3D12Device10*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC1*,
+	D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*, UINT32, const DXGI_FORMAT*,
+	REFIID, void**);
+typedef HRESULT(STDMETHODCALLTYPE *PFN_CREATE_RESERVED_RESOURCE2)(
+	ID3D12Device10*, const D3D12_RESOURCE_DESC*, D3D12_BARRIER_LAYOUT,
+	const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession*, UINT32,
+	const DXGI_FORMAT*, REFIID, void**);
 
 static PFN_CREATE_DESCRIPTOR_HEAP gOrigCreateDescriptorHeap = nullptr;
 static PFN_CREATE_ROOT_SIGNATURE gOrigCreateRootSignature = nullptr;
@@ -57,6 +83,13 @@ static PFN_COPY_DESCRIPTORS_SIMPLE gOrigCopyDescriptorsSimple = nullptr;
 static PFN_CREATE_COMMITTED_RESOURCE gOrigCreateCommittedResource = nullptr;
 static PFN_CREATE_PLACED_RESOURCE gOrigCreatePlacedResource = nullptr;
 static PFN_CREATE_RESERVED_RESOURCE gOrigCreateReservedResource = nullptr;
+static PFN_CREATE_COMMITTED_RESOURCE1 gOrigCreateCommittedResource1 = nullptr;
+static PFN_CREATE_RESERVED_RESOURCE1 gOrigCreateReservedResource1 = nullptr;
+static PFN_CREATE_COMMITTED_RESOURCE2 gOrigCreateCommittedResource2 = nullptr;
+static PFN_CREATE_PLACED_RESOURCE1 gOrigCreatePlacedResource1 = nullptr;
+static PFN_CREATE_COMMITTED_RESOURCE3 gOrigCreateCommittedResource3 = nullptr;
+static PFN_CREATE_PLACED_RESOURCE2 gOrigCreatePlacedResource2 = nullptr;
+static PFN_CREATE_RESERVED_RESOURCE2 gOrigCreateReservedResource2 = nullptr;
 
 struct RootSignatureRecord
 {
@@ -128,6 +161,7 @@ static std::vector<PsoRootRecord> gPsoRoots;
 static std::vector<ResourceRecord> gResources;
 static std::unordered_map<ID3D12Resource*, size_t> gResourceByPtr;
 static bool gCleanupRegistered = false;
+static UINT64 gResourcesRecordedFromCreate = 0;
 
 static UINT64 Fnv1a64(const void *data, size_t size)
 {
@@ -172,6 +206,69 @@ static const char *ResourceDimensionName(D3D12_RESOURCE_DIMENSION dimension)
 	}
 }
 
+static D3D12_RESOURCE_DESC ResourceDescFromDesc1(const D3D12_RESOURCE_DESC1 *desc)
+{
+	D3D12_RESOURCE_DESC out = {};
+	if (!desc)
+		return out;
+	out.Dimension = desc->Dimension;
+	out.Alignment = desc->Alignment;
+	out.Width = desc->Width;
+	out.Height = desc->Height;
+	out.DepthOrArraySize = desc->DepthOrArraySize;
+	out.MipLevels = desc->MipLevels;
+	out.Format = desc->Format;
+	out.SampleDesc = desc->SampleDesc;
+	out.Layout = desc->Layout;
+	out.Flags = desc->Flags;
+	return out;
+}
+
+static D3D12_RESOURCE_STATES ResourceStateFromLayout(D3D12_BARRIER_LAYOUT layout)
+{
+	switch (layout) {
+	case D3D12_BARRIER_LAYOUT_COMMON:
+		return D3D12_RESOURCE_STATE_COMMON;
+	case D3D12_BARRIER_LAYOUT_GENERIC_READ:
+		return D3D12_RESOURCE_STATE_GENERIC_READ;
+	case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+		return D3D12_RESOURCE_STATE_RENDER_TARGET;
+	case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+		return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+		return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+	case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+		return D3D12_RESOURCE_STATE_DEPTH_READ;
+	case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE:
+		return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	case D3D12_BARRIER_LAYOUT_COPY_SOURCE:
+		return D3D12_RESOURCE_STATE_COPY_SOURCE;
+	case D3D12_BARRIER_LAYOUT_COPY_DEST:
+		return D3D12_RESOURCE_STATE_COPY_DEST;
+	case D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE:
+		return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+	case D3D12_BARRIER_LAYOUT_RESOLVE_DEST:
+		return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+	default:
+		return D3D12_RESOURCE_STATE_COMMON;
+	}
+}
+
+static ID3D12Resource *CanonicalResource(ID3D12Resource *resource)
+{
+	if (!resource)
+		return nullptr;
+
+	IUnknown *unknown = nullptr;
+	if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&unknown))) && unknown) {
+		ID3D12Resource *canonical = reinterpret_cast<ID3D12Resource*>(unknown);
+		unknown->Release();
+		return canonical;
+	}
+	return resource;
+}
+
 static void RecordResource(
 	ID3D12Resource *resource, const D3D12_RESOURCE_DESC *desc,
 	const D3D12_HEAP_PROPERTIES *heapProperties,
@@ -180,6 +277,7 @@ static void RecordResource(
 	if (!resource)
 		return;
 
+	ID3D12Resource *canonical = CanonicalResource(resource);
 	ResourceRecord record;
 	record.resource = resource;
 	record.desc = desc ? *desc : resource->GetDesc();
@@ -200,15 +298,16 @@ static void RecordResource(
 	}
 
 	AcquireSRWLockExclusive(&gResourceLock);
-	auto found = gResourceByPtr.find(resource);
+	auto found = gResourceByPtr.find(canonical);
 	if (found != gResourceByPtr.end()) {
 		if (gResources[found->second].resource)
 			gResources[found->second].resource->Release();
 		gResources[found->second] = record;
 	} else {
-		gResourceByPtr[resource] = gResources.size();
+		gResourceByPtr[canonical] = gResources.size();
 		gResources.push_back(record);
 	}
+	gResourcesRecordedFromCreate++;
 	ReleaseSRWLockExclusive(&gResourceLock);
 }
 
@@ -237,8 +336,9 @@ static void FillResourceInfo(DescriptorRecord *record, ID3D12Resource *resource)
 	if (record->resourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
 		record->gpuVirtualAddress = resource->GetGPUVirtualAddress();
 
+	ID3D12Resource *canonical = CanonicalResource(resource);
 	AcquireSRWLockShared(&gResourceLock);
-	auto found = gResourceByPtr.find(resource);
+	auto found = gResourceByPtr.find(canonical);
 	if (found != gResourceByPtr.end() && found->second < gResources.size()) {
 		const ResourceRecord &resourceRecord = gResources[found->second];
 		if (resourceRecord.hasHeapType) {
@@ -609,6 +709,140 @@ static HRESULT STDMETHODCALLTYPE HookedCreateReservedResource(
 	return hr;
 }
 
+static HRESULT STDMETHODCALLTYPE HookedCreateCommittedResource1(
+	ID3D12Device4 *device, const D3D12_HEAP_PROPERTIES *heapProperties,
+	D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC *desc,
+	D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE *optimizedClearValue,
+	ID3D12ProtectedResourceSession *protectedSession, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreateCommittedResource1(device, heapProperties, heapFlags, desc,
+		initialState, optimizedClearValue, protectedSession, riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			RecordResource(d3dResource, desc, heapProperties, initialState);
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateReservedResource1(
+	ID3D12Device4 *device, const D3D12_RESOURCE_DESC *desc,
+	D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE *optimizedClearValue,
+	ID3D12ProtectedResourceSession *protectedSession, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreateReservedResource1(device, desc, initialState,
+		optimizedClearValue, protectedSession, riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			RecordResource(d3dResource, desc, nullptr, initialState);
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateCommittedResource2(
+	ID3D12Device8 *device, const D3D12_HEAP_PROPERTIES *heapProperties,
+	D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC1 *desc,
+	D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE *optimizedClearValue,
+	ID3D12ProtectedResourceSession *protectedSession, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreateCommittedResource2(device, heapProperties, heapFlags, desc,
+		initialState, optimizedClearValue, protectedSession, riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			D3D12_RESOURCE_DESC desc0 = ResourceDescFromDesc1(desc);
+			RecordResource(d3dResource, desc ? &desc0 : nullptr, heapProperties, initialState);
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreatePlacedResource1(
+	ID3D12Device8 *device, ID3D12Heap *heap, UINT64 heapOffset,
+	const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initialState,
+	const D3D12_CLEAR_VALUE *optimizedClearValue, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreatePlacedResource1(device, heap, heapOffset, desc,
+		initialState, optimizedClearValue, riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			D3D12_RESOURCE_DESC desc0 = ResourceDescFromDesc1(desc);
+			RecordResource(d3dResource, desc ? &desc0 : nullptr, nullptr, initialState);
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateCommittedResource3(
+	ID3D12Device10 *device, const D3D12_HEAP_PROPERTIES *heapProperties,
+	D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC1 *desc,
+	D3D12_BARRIER_LAYOUT initialLayout, const D3D12_CLEAR_VALUE *optimizedClearValue,
+	ID3D12ProtectedResourceSession *protectedSession, UINT32 numCastableFormats,
+	const DXGI_FORMAT *castableFormats, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreateCommittedResource3(device, heapProperties, heapFlags, desc,
+		initialLayout, optimizedClearValue, protectedSession, numCastableFormats,
+		castableFormats, riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			D3D12_RESOURCE_DESC desc0 = ResourceDescFromDesc1(desc);
+			RecordResource(d3dResource, desc ? &desc0 : nullptr, heapProperties,
+				ResourceStateFromLayout(initialLayout));
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreatePlacedResource2(
+	ID3D12Device10 *device, ID3D12Heap *heap, UINT64 heapOffset,
+	const D3D12_RESOURCE_DESC1 *desc, D3D12_BARRIER_LAYOUT initialLayout,
+	const D3D12_CLEAR_VALUE *optimizedClearValue, UINT32 numCastableFormats,
+	const DXGI_FORMAT *castableFormats, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreatePlacedResource2(device, heap, heapOffset, desc,
+		initialLayout, optimizedClearValue, numCastableFormats, castableFormats,
+		riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			D3D12_RESOURCE_DESC desc0 = ResourceDescFromDesc1(desc);
+			RecordResource(d3dResource, desc ? &desc0 : nullptr, nullptr,
+				ResourceStateFromLayout(initialLayout));
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateReservedResource2(
+	ID3D12Device10 *device, const D3D12_RESOURCE_DESC *desc,
+	D3D12_BARRIER_LAYOUT initialLayout, const D3D12_CLEAR_VALUE *optimizedClearValue,
+	ID3D12ProtectedResourceSession *protectedSession, UINT32 numCastableFormats,
+	const DXGI_FORMAT *castableFormats, REFIID riid, void **resource)
+{
+	HRESULT hr = gOrigCreateReservedResource2(device, desc, initialLayout,
+		optimizedClearValue, protectedSession, numCastableFormats, castableFormats,
+		riid, resource);
+	if (SUCCEEDED(hr) && resource && *resource) {
+		ID3D12Resource *d3dResource = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown*>(*resource)->QueryInterface(IID_PPV_ARGS(&d3dResource)))) {
+			RecordResource(d3dResource, desc, nullptr, ResourceStateFromLayout(initialLayout));
+			d3dResource->Release();
+		}
+	}
+	return hr;
+}
+
 void DX12HookResourceMetadata(ID3D12Device *device)
 {
 	if (!device)
@@ -649,6 +883,51 @@ void DX12HookResourceMetadata(ID3D12Device *device)
 		vtable[29], HookedCreatePlacedResource, "ID3D12Device::CreatePlacedResource");
 	DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateReservedResource),
 		vtable[30], HookedCreateReservedResource, "ID3D12Device::CreateReservedResource");
+
+	ID3D12Device4 *device4 = nullptr;
+	if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4)))) {
+		void **vtable4 = *reinterpret_cast<void***>(device4);
+		if (vtable4) {
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateCommittedResource1),
+				vtable4[53], HookedCreateCommittedResource1,
+				"ID3D12Device4::CreateCommittedResource1");
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateReservedResource1),
+				vtable4[55], HookedCreateReservedResource1,
+				"ID3D12Device4::CreateReservedResource1");
+		}
+		device4->Release();
+	}
+
+	ID3D12Device8 *device8 = nullptr;
+	if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device8)))) {
+		void **vtable8 = *reinterpret_cast<void***>(device8);
+		if (vtable8) {
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateCommittedResource2),
+				vtable8[69], HookedCreateCommittedResource2,
+				"ID3D12Device8::CreateCommittedResource2");
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreatePlacedResource1),
+				vtable8[70], HookedCreatePlacedResource1,
+				"ID3D12Device8::CreatePlacedResource1");
+		}
+		device8->Release();
+	}
+
+	ID3D12Device10 *device10 = nullptr;
+	if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10)))) {
+		void **vtable10 = *reinterpret_cast<void***>(device10);
+		if (vtable10) {
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateCommittedResource3),
+				vtable10[76], HookedCreateCommittedResource3,
+				"ID3D12Device10::CreateCommittedResource3");
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreatePlacedResource2),
+				vtable10[77], HookedCreatePlacedResource2,
+				"ID3D12Device10::CreatePlacedResource2");
+			DX12HookFunction(reinterpret_cast<void**>(&gOrigCreateReservedResource2),
+				vtable10[78], HookedCreateReservedResource2,
+				"ID3D12Device10::CreateReservedResource2");
+		}
+		device10->Release();
+	}
 }
 
 void DX12RecordPsoRootSignature(
@@ -678,7 +957,8 @@ void DX12RecordResourceBarrier(UINT numBarriers, const D3D12_RESOURCE_BARRIER *b
 			!barrier.Transition.pResource)
 			continue;
 
-		auto found = gResourceByPtr.find(barrier.Transition.pResource);
+		ID3D12Resource *canonical = CanonicalResource(barrier.Transition.pResource);
+		auto found = gResourceByPtr.find(canonical);
 		if (found == gResourceByPtr.end() || found->second >= gResources.size())
 			continue;
 
@@ -750,8 +1030,16 @@ void DX12GetResourceMetadataSnapshot(
 	std::vector<DX12DescriptorHeapSummary> *descriptorHeaps)
 {
 	AcquireSRWLockShared(&gResourceLock);
-	DX12Log("Metadata snapshot: begin roots=%zu descriptors=%zu psoRoots=%zu heaps=%zu requested=%u%u%u%u\n",
-		gRootSignatures.size(), gDescriptors.size(), gPsoRoots.size(), gDescriptorHeaps.size(),
+	size_t descriptorStateKnown = 0;
+	for (const DescriptorRecord &record : gDescriptors) {
+		if (record.hasCurrentState)
+			descriptorStateKnown++;
+	}
+	DX12Log("Metadata snapshot: begin roots=%zu descriptors=%zu descriptorStates=%zu resources=%zu resourcesFromCreate=%llu psoRoots=%zu heaps=%zu requested=%u%u%u%u\n",
+		gRootSignatures.size(), gDescriptors.size(), descriptorStateKnown,
+		gResources.size(),
+		static_cast<unsigned long long>(gResourcesRecordedFromCreate),
+		gPsoRoots.size(), gDescriptorHeaps.size(),
 		rootSignatures ? 1 : 0,
 		descriptors ? 1 : 0,
 		psoRoots ? 1 : 0,
