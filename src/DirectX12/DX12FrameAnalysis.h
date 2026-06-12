@@ -17,7 +17,7 @@ public:
 	bool IsCaptureRequested();
 	bool IsCapturing();
 	bool GetPath(wchar_t *path, size_t pathCount);
-	void LogInfo(const char *fmt, ...);
+	void LogEvent(const char *fmt, ...);
 
 private:
 	DX12FrameAnalysisState();
@@ -50,4 +50,5 @@ bool DX12FrameAnalysisIsActive();
 bool DX12FrameAnalysisIsCaptureRequested();
 bool DX12FrameAnalysisIsCapturing();
 bool DX12FrameAnalysisGetPath(wchar_t *path, size_t pathCount);
+void DX12FrameAnalysisLogEvent(const char *fmt, ...);
 void DX12FrameAnalysisLogInfo(const char *fmt, ...);

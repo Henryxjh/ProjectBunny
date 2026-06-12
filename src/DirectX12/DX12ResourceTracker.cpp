@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -106,6 +107,11 @@ struct RootSignatureRecord
 	UINT64 hash = 0;
 	SIZE_T size = 0;
 	UINT nodeMask = 0;
+	UINT version = 0;
+	UINT flags = 0;
+	UINT staticSamplerCount = 0;
+	bool parsed = false;
+	std::vector<DX12RootParameterSummary> parameters;
 };
 
 struct DescriptorHeapRecord
@@ -171,6 +177,15 @@ static std::vector<ResourceRecord> gResources;
 static std::unordered_map<ID3D12Resource*, size_t> gResourceByPtr;
 static bool gCleanupRegistered = false;
 static UINT64 gResourcesRecordedFromCreate = 0;
+
+typedef HRESULT(WINAPI *PFN_D3D12_CREATE_ROOT_SIGNATURE_DESERIALIZER_LOCAL)(
+	LPCVOID, SIZE_T, REFIID, void**);
+typedef HRESULT(WINAPI *PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER_LOCAL)(
+	LPCVOID, SIZE_T, REFIID, void**);
+
+static HMODULE gD3D12ForDeserialization = nullptr;
+static PFN_D3D12_CREATE_ROOT_SIGNATURE_DESERIALIZER_LOCAL gCreateRootSignatureDeserializer = nullptr;
+static PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER_LOCAL gCreateVersionedRootSignatureDeserializer = nullptr;
 
 static UINT64 Fnv1a64(const void *data, size_t size)
 {
@@ -323,6 +338,230 @@ static void CleanupTrackedResources()
 	gResources.clear();
 	gResourceByPtr.clear();
 	ReleaseSRWLockExclusive(&gResourceLock);
+}
+
+static bool EnsureRootSignatureDeserializerFunctions()
+{
+	if (gCreateRootSignatureDeserializer || gCreateVersionedRootSignatureDeserializer)
+		return true;
+
+	if (!gD3D12ForDeserialization) {
+		wchar_t path[MAX_PATH];
+		if (GetSystemDirectoryW(path, MAX_PATH)) {
+			PathAppendW(path, L"d3d12.dll");
+			gD3D12ForDeserialization = LoadLibraryW(path);
+		}
+		if (!gD3D12ForDeserialization)
+			gD3D12ForDeserialization = LoadLibraryW(L"d3d12.dll");
+	}
+
+	if (!gD3D12ForDeserialization)
+		return false;
+
+	gCreateRootSignatureDeserializer =
+		reinterpret_cast<PFN_D3D12_CREATE_ROOT_SIGNATURE_DESERIALIZER_LOCAL>(
+			GetProcAddress(gD3D12ForDeserialization, "D3D12CreateRootSignatureDeserializer"));
+	gCreateVersionedRootSignatureDeserializer =
+		reinterpret_cast<PFN_D3D12_CREATE_VERSIONED_ROOT_SIGNATURE_DESERIALIZER_LOCAL>(
+			GetProcAddress(gD3D12ForDeserialization, "D3D12CreateVersionedRootSignatureDeserializer"));
+	return gCreateRootSignatureDeserializer || gCreateVersionedRootSignatureDeserializer;
+}
+
+static UINT RootSignatureVersionNumber(D3D_ROOT_SIGNATURE_VERSION version)
+{
+	switch (version) {
+	case D3D_ROOT_SIGNATURE_VERSION_1_0:
+		return 0x10;
+	case D3D_ROOT_SIGNATURE_VERSION_1_1:
+		return 0x11;
+	default:
+		return static_cast<UINT>(version);
+	}
+}
+
+static void RecordDescriptorRange(
+	DX12RootParameterSummary *parameter, UINT rangeIndex,
+	const D3D12_DESCRIPTOR_RANGE &range, UINT *appendOffset)
+{
+	if (!parameter || !appendOffset)
+		return;
+
+	DX12RootDescriptorRangeSummary summary;
+	summary.rootParameterIndex = parameter->rootParameterIndex;
+	summary.rangeIndex = rangeIndex;
+	summary.rangeType = static_cast<UINT>(range.RangeType);
+	summary.numDescriptors = range.NumDescriptors;
+	summary.baseShaderRegister = range.BaseShaderRegister;
+	summary.registerSpace = range.RegisterSpace;
+	summary.offsetInDescriptorsFromTableStart = range.OffsetInDescriptorsFromTableStart;
+	summary.shaderVisibility = parameter->shaderVisibility;
+	if (range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+		summary.effectiveOffset = *appendOffset;
+	else
+		summary.effectiveOffset = range.OffsetInDescriptorsFromTableStart;
+
+	if (range.NumDescriptors != UINT_MAX) {
+		const UINT64 end = static_cast<UINT64>(summary.effectiveOffset) + range.NumDescriptors;
+		*appendOffset = end > UINT_MAX ? UINT_MAX : static_cast<UINT>(end);
+	}
+
+	parameter->ranges.push_back(summary);
+}
+
+static void RecordDescriptorRange1(
+	DX12RootParameterSummary *parameter, UINT rangeIndex,
+	const D3D12_DESCRIPTOR_RANGE1 &range, UINT *appendOffset)
+{
+	if (!parameter || !appendOffset)
+		return;
+
+	DX12RootDescriptorRangeSummary summary;
+	summary.rootParameterIndex = parameter->rootParameterIndex;
+	summary.rangeIndex = rangeIndex;
+	summary.rangeType = static_cast<UINT>(range.RangeType);
+	summary.numDescriptors = range.NumDescriptors;
+	summary.baseShaderRegister = range.BaseShaderRegister;
+	summary.registerSpace = range.RegisterSpace;
+	summary.offsetInDescriptorsFromTableStart = range.OffsetInDescriptorsFromTableStart;
+	summary.flags = static_cast<UINT>(range.Flags);
+	summary.shaderVisibility = parameter->shaderVisibility;
+	if (range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+		summary.effectiveOffset = *appendOffset;
+	else
+		summary.effectiveOffset = range.OffsetInDescriptorsFromTableStart;
+
+	if (range.NumDescriptors != UINT_MAX) {
+		const UINT64 end = static_cast<UINT64>(summary.effectiveOffset) + range.NumDescriptors;
+		*appendOffset = end > UINT_MAX ? UINT_MAX : static_cast<UINT>(end);
+	}
+
+	parameter->ranges.push_back(summary);
+}
+
+static void ParseRootParameter(
+	RootSignatureRecord *record, UINT index, const D3D12_ROOT_PARAMETER &source)
+{
+	if (!record)
+		return;
+
+	DX12RootParameterSummary parameter;
+	parameter.rootParameterIndex = index;
+	parameter.parameterType = static_cast<UINT>(source.ParameterType);
+	parameter.shaderVisibility = static_cast<UINT>(source.ShaderVisibility);
+	switch (source.ParameterType) {
+	case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+		UINT appendOffset = 0;
+		for (UINT i = 0; i < source.DescriptorTable.NumDescriptorRanges; ++i)
+			RecordDescriptorRange(&parameter, i, source.DescriptorTable.pDescriptorRanges[i], &appendOffset);
+		break;
+	}
+	case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+		parameter.shaderRegister = source.Constants.ShaderRegister;
+		parameter.registerSpace = source.Constants.RegisterSpace;
+		parameter.num32BitValues = source.Constants.Num32BitValues;
+		break;
+	case D3D12_ROOT_PARAMETER_TYPE_CBV:
+	case D3D12_ROOT_PARAMETER_TYPE_SRV:
+	case D3D12_ROOT_PARAMETER_TYPE_UAV:
+		parameter.shaderRegister = source.Descriptor.ShaderRegister;
+		parameter.registerSpace = source.Descriptor.RegisterSpace;
+		break;
+	default:
+		break;
+	}
+	record->parameters.push_back(std::move(parameter));
+}
+
+static void ParseRootParameter1(
+	RootSignatureRecord *record, UINT index, const D3D12_ROOT_PARAMETER1 &source)
+{
+	if (!record)
+		return;
+
+	DX12RootParameterSummary parameter;
+	parameter.rootParameterIndex = index;
+	parameter.parameterType = static_cast<UINT>(source.ParameterType);
+	parameter.shaderVisibility = static_cast<UINT>(source.ShaderVisibility);
+	switch (source.ParameterType) {
+	case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+		UINT appendOffset = 0;
+		for (UINT i = 0; i < source.DescriptorTable.NumDescriptorRanges; ++i)
+			RecordDescriptorRange1(&parameter, i, source.DescriptorTable.pDescriptorRanges[i], &appendOffset);
+		break;
+	}
+	case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+		parameter.shaderRegister = source.Constants.ShaderRegister;
+		parameter.registerSpace = source.Constants.RegisterSpace;
+		parameter.num32BitValues = source.Constants.Num32BitValues;
+		break;
+	case D3D12_ROOT_PARAMETER_TYPE_CBV:
+	case D3D12_ROOT_PARAMETER_TYPE_SRV:
+	case D3D12_ROOT_PARAMETER_TYPE_UAV:
+		parameter.shaderRegister = source.Descriptor.ShaderRegister;
+		parameter.registerSpace = source.Descriptor.RegisterSpace;
+		parameter.rootDescriptorFlags = static_cast<UINT>(source.Descriptor.Flags);
+		break;
+	default:
+		break;
+	}
+	record->parameters.push_back(std::move(parameter));
+}
+
+static void ParseRootSignatureBlob(RootSignatureRecord *record, const void *blob, SIZE_T blobLength)
+{
+	if (!record || !blob || blobLength == 0)
+		return;
+	if (!EnsureRootSignatureDeserializerFunctions())
+		return;
+
+	ID3D12VersionedRootSignatureDeserializer *versioned = nullptr;
+	HRESULT hr = gCreateVersionedRootSignatureDeserializer ?
+		gCreateVersionedRootSignatureDeserializer(blob, blobLength, IID_PPV_ARGS(&versioned)) :
+		E_NOINTERFACE;
+	if (SUCCEEDED(hr) && versioned) {
+		const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc = nullptr;
+		hr = versioned->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc);
+		if (FAILED(hr))
+			hr = versioned->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_0, &desc);
+		if (SUCCEEDED(hr) && desc) {
+			record->version = RootSignatureVersionNumber(desc->Version);
+			if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+				record->flags = static_cast<UINT>(desc->Desc_1_1.Flags);
+				record->staticSamplerCount = desc->Desc_1_1.NumStaticSamplers;
+				record->parameters.reserve(desc->Desc_1_1.NumParameters);
+				for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i)
+					ParseRootParameter1(record, i, desc->Desc_1_1.pParameters[i]);
+			} else {
+				record->flags = static_cast<UINT>(desc->Desc_1_0.Flags);
+				record->staticSamplerCount = desc->Desc_1_0.NumStaticSamplers;
+				record->parameters.reserve(desc->Desc_1_0.NumParameters);
+				for (UINT i = 0; i < desc->Desc_1_0.NumParameters; ++i)
+					ParseRootParameter(record, i, desc->Desc_1_0.pParameters[i]);
+			}
+			record->parsed = true;
+		}
+		versioned->Release();
+		return;
+	}
+
+	ID3D12RootSignatureDeserializer *legacy = nullptr;
+	hr = gCreateRootSignatureDeserializer ?
+		gCreateRootSignatureDeserializer(blob, blobLength, IID_PPV_ARGS(&legacy)) :
+		E_NOINTERFACE;
+	if (FAILED(hr) || !legacy)
+		return;
+
+	const D3D12_ROOT_SIGNATURE_DESC *desc = legacy->GetRootSignatureDesc();
+	if (desc) {
+		record->version = RootSignatureVersionNumber(D3D_ROOT_SIGNATURE_VERSION_1_0);
+		record->flags = static_cast<UINT>(desc->Flags);
+		record->staticSamplerCount = desc->NumStaticSamplers;
+		record->parameters.reserve(desc->NumParameters);
+		for (UINT i = 0; i < desc->NumParameters; ++i)
+			ParseRootParameter(record, i, desc->pParameters[i]);
+		record->parsed = true;
+	}
+	legacy->Release();
 }
 
 static void FillResourceInfo(DescriptorRecord *record, ID3D12Resource *resource)
@@ -634,6 +873,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateRootSignature(
 		record.hash = Fnv1a64(blob, blobLength);
 		record.size = blobLength;
 		record.nodeMask = nodeMask;
+		ParseRootSignatureBlob(&record, blob, blobLength);
 
 		AcquireSRWLockExclusive(&gResourceLock);
 		gRootSignatures.push_back(record);
@@ -1087,6 +1327,50 @@ void DX12RecordPsoRootSignature(
 	ReleaseSRWLockExclusive(&gResourceLock);
 }
 
+bool DX12GetRootSignatureSummary(
+	ID3D12RootSignature *rootSignature, DX12RootSignatureSummary *summary)
+{
+	if (!rootSignature || !summary)
+		return false;
+
+	AcquireSRWLockShared(&gResourceLock);
+	for (const RootSignatureRecord &record : gRootSignatures) {
+		if (record.rootSignature != rootSignature)
+			continue;
+		summary->rootSignature = record.rootSignature;
+		summary->hash = record.hash;
+		summary->size = record.size;
+		summary->nodeMask = record.nodeMask;
+		summary->version = record.version;
+		summary->flags = record.flags;
+		summary->staticSamplerCount = record.staticSamplerCount;
+		summary->parsed = record.parsed;
+		summary->parameters = record.parameters;
+		ReleaseSRWLockShared(&gResourceLock);
+		return true;
+	}
+	ReleaseSRWLockShared(&gResourceLock);
+	return false;
+}
+
+bool DX12GetPsoRootSignature(UINT64 psoIndex, ID3D12RootSignature **rootSignature)
+{
+	if (!psoIndex || !rootSignature)
+		return false;
+
+	*rootSignature = nullptr;
+	AcquireSRWLockShared(&gResourceLock);
+	for (auto it = gPsoRoots.rbegin(); it != gPsoRoots.rend(); ++it) {
+		if (it->psoIndex != psoIndex || !it->rootSignature)
+			continue;
+		*rootSignature = it->rootSignature;
+		ReleaseSRWLockShared(&gResourceLock);
+		return true;
+	}
+	ReleaseSRWLockShared(&gResourceLock);
+	return false;
+}
+
 void DX12RecordResourceBarrier(UINT numBarriers, const D3D12_RESOURCE_BARRIER *barriers)
 {
 	if (!barriers || numBarriers == 0)
@@ -1247,6 +1531,11 @@ void DX12GetResourceMetadataSnapshot(
 			summary.hash = record.hash;
 			summary.size = record.size;
 			summary.nodeMask = record.nodeMask;
+			summary.version = record.version;
+			summary.flags = record.flags;
+			summary.staticSamplerCount = record.staticSamplerCount;
+			summary.parsed = record.parsed;
+			summary.parameters = record.parameters;
 			rootSignatures->push_back(summary);
 		}
 		DX12FrameAnalysisLogInfo("Metadata snapshot: roots copied=%zu\n", rootSignatures->size());
@@ -1358,15 +1647,58 @@ void DX12DumpResourceMetadata(const wchar_t *dir)
 	}
 
 	fprintf(file, "\nRoot Signatures\n");
-	fprintf(file, "index,root_signature,hash,size,node_mask\n");
+	fprintf(file, "index,root_signature,hash,size,node_mask,version,flags,static_samplers,parsed,parameters\n");
 	for (size_t i = 0; i < rootSignatures.size(); ++i) {
 		const RootSignatureRecord &record = rootSignatures[i];
-		fprintf(file, "%zu,%p,%016llx,%zu,%u\n",
+		fprintf(file, "%zu,%p,%016llx,%zu,%u,0x%x,0x%x,%u,%u,%zu\n",
 			i,
 			record.rootSignature,
 			static_cast<unsigned long long>(record.hash),
 			record.size,
-			record.nodeMask);
+			record.nodeMask,
+			record.version,
+			record.flags,
+			record.staticSamplerCount,
+			record.parsed ? 1 : 0,
+			record.parameters.size());
+	}
+
+	fprintf(file, "\nRoot Parameters\n");
+	fprintf(file, "root_signature,root_param,type,visibility,shader_register,space,root_descriptor_flags,num32bit_values,range_count\n");
+	for (const RootSignatureRecord &record : rootSignatures) {
+		for (const DX12RootParameterSummary &parameter : record.parameters) {
+			fprintf(file, "%p,%u,%u,%u,%u,%u,0x%x,%u,%zu\n",
+				record.rootSignature,
+				parameter.rootParameterIndex,
+				parameter.parameterType,
+				parameter.shaderVisibility,
+				parameter.shaderRegister,
+				parameter.registerSpace,
+				parameter.rootDescriptorFlags,
+				parameter.num32BitValues,
+				parameter.ranges.size());
+		}
+	}
+
+	fprintf(file, "\nRoot Descriptor Ranges\n");
+	fprintf(file, "root_signature,root_param,range_index,range_type,num_descriptors,base_shader_register,space,offset,effective_offset,flags,visibility\n");
+	for (const RootSignatureRecord &record : rootSignatures) {
+		for (const DX12RootParameterSummary &parameter : record.parameters) {
+			for (const DX12RootDescriptorRangeSummary &range : parameter.ranges) {
+				fprintf(file, "%p,%u,%u,%u,%u,%u,%u,%u,%u,0x%x,%u\n",
+					record.rootSignature,
+					range.rootParameterIndex,
+					range.rangeIndex,
+					range.rangeType,
+					range.numDescriptors,
+					range.baseShaderRegister,
+					range.registerSpace,
+					range.offsetInDescriptorsFromTableStart,
+					range.effectiveOffset,
+					range.flags,
+					range.shaderVisibility);
+			}
+		}
 	}
 
 	fprintf(file, "\nDescriptor Heaps\n");

@@ -6,12 +6,43 @@
 #include <string>
 #include <vector>
 
+struct DX12RootDescriptorRangeSummary
+{
+	UINT rootParameterIndex = 0;
+	UINT rangeIndex = 0;
+	UINT rangeType = 0;
+	UINT numDescriptors = 0;
+	UINT baseShaderRegister = 0;
+	UINT registerSpace = 0;
+	UINT offsetInDescriptorsFromTableStart = 0;
+	UINT flags = 0;
+	UINT effectiveOffset = 0;
+	UINT shaderVisibility = 0;
+};
+
+struct DX12RootParameterSummary
+{
+	UINT rootParameterIndex = 0;
+	UINT parameterType = 0;
+	UINT shaderVisibility = 0;
+	UINT shaderRegister = 0;
+	UINT registerSpace = 0;
+	UINT rootDescriptorFlags = 0;
+	UINT num32BitValues = 0;
+	std::vector<DX12RootDescriptorRangeSummary> ranges;
+};
+
 struct DX12RootSignatureSummary
 {
 	ID3D12RootSignature *rootSignature = nullptr;
 	UINT64 hash = 0;
 	SIZE_T size = 0;
 	UINT nodeMask = 0;
+	UINT version = 0;
+	UINT flags = 0;
+	UINT staticSamplerCount = 0;
+	bool parsed = false;
+	std::vector<DX12RootParameterSummary> parameters;
 };
 
 struct DX12DescriptorSummary
@@ -81,6 +112,9 @@ void DX12RecordPsoRootSignature(
 void DX12RecordResourceBarrier(UINT numBarriers, const D3D12_RESOURCE_BARRIER *barriers);
 bool DX12ResolveBufferResourceByGpuVa(
 	UINT64 gpuVirtualAddress, UINT64 size, DX12BufferResourceSummary *summary);
+bool DX12GetRootSignatureSummary(
+	ID3D12RootSignature *rootSignature, DX12RootSignatureSummary *summary);
+bool DX12GetPsoRootSignature(UINT64 psoIndex, ID3D12RootSignature **rootSignature);
 void DX12GetResourceMetadataSnapshot(
 	std::vector<DX12RootSignatureSummary> *rootSignatures,
 	std::vector<DX12DescriptorSummary> *descriptors,

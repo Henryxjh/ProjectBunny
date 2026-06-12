@@ -15,7 +15,7 @@ void DX12PollInput()
 	if (f8Down && !gF8WasDown) {
 		DX12Log("F8 pressed; frame analysis requested\n");
 		if (DX12FrameAnalysisBegin()) {
-			DX12FrameAnalysisLogInfo("----- Frame analysis armed -----\n");
+			DX12FrameAnalysisLogEvent("FrameAnalysisArmed\n");
 			DX12FrameAnalysisRequestCapture();
 			DX12SetOverlayStatus(L"F8 frame analysis armed");
 		} else {

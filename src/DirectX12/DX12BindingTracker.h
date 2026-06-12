@@ -18,12 +18,19 @@ struct DX12FrameResourceBinding
 	DX12PsoShaderInfo shaderInfo;
 	std::string bindSpace;
 	UINT rootParameterIndex = 0;
+	UINT rangeIndex = UINT_MAX;
+	UINT rangeType = UINT_MAX;
+	UINT shaderRegister = UINT_MAX;
+	UINT registerSpace = 0;
+	UINT descriptorOffset = 0;
+	bool rootDescriptor = false;
 	ID3D12DescriptorHeap *heap = nullptr;
 	UINT heapType = 0;
 	UINT64 descriptorIndex = 0;
 	UINT64 gpuHandle = 0;
 	SIZE_T cpuHandle = 0;
 	UINT64 heapGpuStart = 0;
+	UINT64 gpuVirtualAddress = 0;
 	DX12DescriptorSummary descriptor;
 	bool hasDescriptor = false;
 };
@@ -61,6 +68,16 @@ void DX12BindingSetGraphicsRootDescriptorTable(
 void DX12BindingSetComputeRootDescriptorTable(
 	ID3D12GraphicsCommandList *commandList, UINT rootParameterIndex,
 	D3D12_GPU_DESCRIPTOR_HANDLE baseDescriptor);
+void DX12BindingSetGraphicsRootSignature(
+	ID3D12GraphicsCommandList *commandList, ID3D12RootSignature *rootSignature);
+void DX12BindingSetComputeRootSignature(
+	ID3D12GraphicsCommandList *commandList, ID3D12RootSignature *rootSignature);
+void DX12BindingSetGraphicsRootDescriptor(
+	ID3D12GraphicsCommandList *commandList, UINT rootParameterIndex,
+	D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address);
+void DX12BindingSetComputeRootDescriptor(
+	ID3D12GraphicsCommandList *commandList, UINT rootParameterIndex,
+	D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address);
 void DX12BindingSetPrimitiveTopology(
 	ID3D12GraphicsCommandList *commandList, D3D12_PRIMITIVE_TOPOLOGY topology);
 void DX12BindingSetIndexBuffer(

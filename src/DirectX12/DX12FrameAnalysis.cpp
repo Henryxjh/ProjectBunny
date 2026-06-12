@@ -181,7 +181,7 @@ void DX12FrameAnalysisState::CloseLogLocked()
 	}
 }
 
-void DX12FrameAnalysisState::LogInfo(const char *fmt, ...)
+void DX12FrameAnalysisState::LogEvent(const char *fmt, ...)
 {
 	va_list args;
 
@@ -244,7 +244,7 @@ bool DX12FrameAnalysisGetPath(wchar_t *path, size_t pathCount)
 	return DX12FrameAnalysisState::Get().GetPath(path, pathCount);
 }
 
-void DX12FrameAnalysisLogInfo(const char *fmt, ...)
+void DX12FrameAnalysisLogEvent(const char *fmt, ...)
 {
 	va_list args;
 	char buffer[1024];
@@ -255,5 +255,16 @@ void DX12FrameAnalysisLogInfo(const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer), fmt, args);
 	va_end(args);
-	DX12FrameAnalysisState::Get().LogInfo("%s", buffer);
+	DX12FrameAnalysisState::Get().LogEvent("%s", buffer);
+}
+
+void DX12FrameAnalysisLogInfo(const char *fmt, ...)
+{
+	va_list args;
+	char buffer[1024];
+
+	va_start(args, fmt);
+	vsnprintf(buffer, sizeof(buffer), fmt, args);
+	va_end(args);
+	DX12Log("FrameAnalysis %s", buffer);
 }

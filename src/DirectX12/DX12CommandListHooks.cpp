@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "DX12BindingTracker.h"
 #include "DX12FrameAnalysis.h"
@@ -197,6 +198,34 @@ static void LogDX12Call(const char *name, const void *object, const char *fmt = 
 {
 	if (!DX12FrameAnalysisIsCapturing())
 		return;
+	if (!name)
+		return;
+
+	const char *shortName = strrchr(name, ':');
+	shortName = shortName ? shortName + 1 : name;
+	if (shortName[0] == ':')
+		shortName++;
+
+	if (strcmp(shortName, "SetPipelineState") &&
+		strcmp(shortName, "SetGraphicsRootSignature") &&
+		strcmp(shortName, "SetComputeRootSignature") &&
+		strcmp(shortName, "SetDescriptorHeaps") &&
+		strcmp(shortName, "SetGraphicsRootDescriptorTable") &&
+		strcmp(shortName, "SetComputeRootDescriptorTable") &&
+		strcmp(shortName, "SetGraphicsRootConstantBufferView") &&
+		strcmp(shortName, "SetComputeRootConstantBufferView") &&
+		strcmp(shortName, "SetGraphicsRootShaderResourceView") &&
+		strcmp(shortName, "SetComputeRootShaderResourceView") &&
+		strcmp(shortName, "SetGraphicsRootUnorderedAccessView") &&
+		strcmp(shortName, "SetComputeRootUnorderedAccessView") &&
+		strcmp(shortName, "IASetPrimitiveTopology") &&
+		strcmp(shortName, "IASetIndexBuffer") &&
+		strcmp(shortName, "IASetVertexBuffers") &&
+		strcmp(shortName, "DrawInstanced") &&
+		strcmp(shortName, "DrawIndexedInstanced") &&
+		strcmp(shortName, "Dispatch") &&
+		strcmp(shortName, "ExecuteIndirect"))
+		return;
 
 	char extra[512] = {};
 	if (fmt) {
@@ -206,13 +235,40 @@ static void LogDX12Call(const char *name, const void *object, const char *fmt = 
 		va_end(args);
 	}
 
-	DX12FrameAnalysisLogInfo("DX12Call frame=%ld %s this=%p%s\n",
-		DX12GetPresentCount(), name, object, extra);
+	DX12FrameAnalysisLogEvent("%s list=%p%s\n", shortName, object, extra);
 }
 
 static bool ShouldTrackBindings()
 {
 	return DX12FrameAnalysisIsCapturing() || DX12ShaderDumpIsCapturingFrame();
+}
+
+static void FormatVertexBufferViews(
+	char *text, size_t textCount, UINT startSlot, UINT count,
+	const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+	if (!text || textCount == 0)
+		return;
+	text[0] = '\0';
+	if (!views || count == 0)
+		return;
+
+	const UINT maxLogged = count > 8 ? 8 : count;
+	size_t used = 0;
+	for (UINT i = 0; i < maxLogged && used < textCount; ++i) {
+		int written = sprintf_s(text + used, textCount - used,
+			"%s%u:gpu=0x%llx,size=%u,stride=%u",
+			i ? ";" : "",
+			startSlot + i,
+			static_cast<unsigned long long>(views[i].BufferLocation),
+			views[i].SizeInBytes,
+			views[i].StrideInBytes);
+		if (written <= 0)
+			break;
+		used += static_cast<size_t>(written);
+	}
+	if (count > maxLogged && used < textCount)
+		sprintf_s(text + used, textCount - used, ";...");
 }
 
 struct ThreadLocalCommandListOriginal
@@ -249,7 +305,7 @@ static T GetCommandListOriginal(
 	if (fallback)
 		return fallback;
 
-	DX12FrameAnalysisLogInfo("DX12CallMissingOriginal %s this=%p slot=%u\n",
+	DX12Log("DX12CallMissingOriginal %s this=%p slot=%u\n",
 		name ? name : "unknown", commandList, slot);
 	return nullptr;
 }
@@ -643,8 +699,10 @@ static void STDMETHODCALLTYPE HookedSetComputeRootSignature(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetComputeRootSignature", commandList,
 		" rootSignature=%p", rootSignature);
-	if (ShouldTrackBindings())
+	if (ShouldTrackBindings()) {
+		DX12BindingSetComputeRootSignature(commandList, rootSignature);
 		DX12BindingRecordStateEvent(commandList, "set_compute_root_signature");
+	}
 	PFN_SET_ROOT_SIGNATURE original =
 		DX12_CL_ORIG(commandList, 29, PFN_SET_ROOT_SIGNATURE, SetComputeRootSignature);
 	if (original)
@@ -656,8 +714,10 @@ static void STDMETHODCALLTYPE HookedSetGraphicsRootSignature(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetGraphicsRootSignature", commandList,
 		" rootSignature=%p", rootSignature);
-	if (ShouldTrackBindings())
+	if (ShouldTrackBindings()) {
+		DX12BindingSetGraphicsRootSignature(commandList, rootSignature);
 		DX12BindingRecordStateEvent(commandList, "set_graphics_root_signature");
+	}
 	PFN_SET_ROOT_SIGNATURE original =
 		DX12_CL_ORIG(commandList, 30, PFN_SET_ROOT_SIGNATURE, SetGraphicsRootSignature);
 	if (original)
@@ -749,6 +809,11 @@ static void STDMETHODCALLTYPE HookedSetComputeRootConstantBufferView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetComputeRootConstantBufferView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetComputeRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_CBV, address);
+		DX12BindingRecordStateEvent(commandList, "set_compute_root_cbv");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 37, PFN_SET_ROOT_GPU_VA, SetComputeRootConstantBufferView);
 	if (original)
@@ -760,6 +825,11 @@ static void STDMETHODCALLTYPE HookedSetGraphicsRootConstantBufferView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetGraphicsRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_CBV, address);
+		DX12BindingRecordStateEvent(commandList, "set_graphics_root_cbv");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 38, PFN_SET_ROOT_GPU_VA, SetGraphicsRootConstantBufferView);
 	if (original)
@@ -771,6 +841,11 @@ static void STDMETHODCALLTYPE HookedSetComputeRootShaderResourceView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetComputeRootShaderResourceView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetComputeRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_SRV, address);
+		DX12BindingRecordStateEvent(commandList, "set_compute_root_srv");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 39, PFN_SET_ROOT_GPU_VA, SetComputeRootShaderResourceView);
 	if (original)
@@ -782,6 +857,11 @@ static void STDMETHODCALLTYPE HookedSetGraphicsRootShaderResourceView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetGraphicsRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_SRV, address);
+		DX12BindingRecordStateEvent(commandList, "set_graphics_root_srv");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 40, PFN_SET_ROOT_GPU_VA, SetGraphicsRootShaderResourceView);
 	if (original)
@@ -793,6 +873,11 @@ static void STDMETHODCALLTYPE HookedSetComputeRootUnorderedAccessView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetComputeRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_UAV, address);
+		DX12BindingRecordStateEvent(commandList, "set_compute_root_uav");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 41, PFN_SET_ROOT_GPU_VA, SetComputeRootUnorderedAccessView);
 	if (original)
@@ -804,6 +889,11 @@ static void STDMETHODCALLTYPE HookedSetGraphicsRootUnorderedAccessView(
 {
 	LogDX12Call("ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView", commandList,
 		" root=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(address));
+	if (ShouldTrackBindings()) {
+		DX12BindingSetGraphicsRootDescriptor(
+			commandList, rootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_UAV, address);
+		DX12BindingRecordStateEvent(commandList, "set_graphics_root_uav");
+	}
 	PFN_SET_ROOT_GPU_VA original =
 		DX12_CL_ORIG(commandList, 42, PFN_SET_ROOT_GPU_VA, SetGraphicsRootUnorderedAccessView);
 	if (original)
@@ -814,7 +904,10 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(
 	ID3D12GraphicsCommandList *commandList, const D3D12_INDEX_BUFFER_VIEW *view)
 {
 	LogDX12Call("ID3D12GraphicsCommandList::IASetIndexBuffer", commandList,
-		" view=%p size=%u", view, view ? view->SizeInBytes : 0);
+		" gpu=0x%llx size=%u format=%u",
+		view ? static_cast<unsigned long long>(view->BufferLocation) : 0ull,
+		view ? view->SizeInBytes : 0,
+		view ? static_cast<UINT>(view->Format) : 0);
 	if (ShouldTrackBindings())
 		DX12BindingSetIndexBuffer(commandList, view);
 	PFN_IA_SET_INDEX_BUFFER original = DX12_CL_ORIG(commandList, 43, PFN_IA_SET_INDEX_BUFFER, IASetIndexBuffer);
@@ -826,8 +919,10 @@ static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
 	ID3D12GraphicsCommandList *commandList, UINT startSlot, UINT count,
 	const D3D12_VERTEX_BUFFER_VIEW *views)
 {
+	char viewsText[512];
+	FormatVertexBufferViews(viewsText, sizeof(viewsText), startSlot, count, views);
 	LogDX12Call("ID3D12GraphicsCommandList::IASetVertexBuffers", commandList,
-		" start=%u count=%u", startSlot, count);
+		" start=%u count=%u views=%s", startSlot, count, viewsText);
 	if (ShouldTrackBindings())
 		DX12BindingSetVertexBuffers(commandList, startSlot, count, views);
 	PFN_IA_SET_VERTEX_BUFFERS original =

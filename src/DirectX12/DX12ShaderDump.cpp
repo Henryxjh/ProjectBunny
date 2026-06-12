@@ -1436,24 +1436,17 @@ void DX12DumpFrameAnalysis()
 	std::vector<PsoRecord> psos;
 	SnapshotShadersAndPsos(&shaders, &psos);
 
-	DX12Log("F8 stage: resource metadata begin\n");
-	DX12FrameAnalysisLogInfo("F8 stage: resource metadata begin\n");
-	DX12DumpResourceMetadata(dir);
-	DX12Log("F8 stage: binding trace begin\n");
-	DX12FrameAnalysisLogInfo("F8 stage: binding trace begin\n");
-	bool bindingTraceOk = TryDumpBindingTrace(dir);
 	DX12Log("F8 stage: resource files begin\n");
-	DX12FrameAnalysisLogInfo("F8 stage: resource files begin\n");
+	DX12FrameAnalysisLogEvent("FrameAnalysisSummary dir=%S shaders=%zu psos=%zu\n",
+		dir, shaders.size(), psos.size());
 	bool resourceFilesOk = TryDumpCurrentFrameResources(dir);
 
 	DX12SetOverlayStatus(L"F8 frame analysis complete");
-	DX12Log("F8 frame analysis complete: dir=%S shadersReferenced=%zu psos=%zu bindingTrace=%u resourceFiles=%u\n",
+	DX12Log("F8 frame analysis complete: dir=%S shadersReferenced=%zu psos=%zu resourceFiles=%u\n",
 		dir, shaders.size(), psos.size(),
-		bindingTraceOk ? 1 : 0,
 		resourceFilesOk ? 1 : 0);
-	DX12FrameAnalysisLogInfo("F8 frame analysis complete: dir=%S shadersReferenced=%zu psos=%zu bindingTrace=%u resourceFiles=%u\n",
-		dir, shaders.size(), psos.size(),
-		bindingTraceOk ? 1 : 0,
+	DX12FrameAnalysisLogEvent("FrameAnalysisComplete shaders=%zu psos=%zu resourceFiles=%u\n",
+		shaders.size(), psos.size(),
 		resourceFilesOk ? 1 : 0);
 }
 

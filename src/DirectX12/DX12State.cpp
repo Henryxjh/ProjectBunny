@@ -158,6 +158,15 @@ void DX12GetOverlayStatus(wchar_t *status, size_t statusCount)
 
 void DX12SetCommandQueue(ID3D12CommandQueue *queue)
 {
+	if (queue) {
+		D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+		if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+			DX12Log("Ignoring non-direct command queue for frame analysis readback: queue=%p type=%d\n",
+				queue, static_cast<int>(desc.Type));
+			return;
+		}
+	}
+
 	if (queue)
 		queue->AddRef();
 

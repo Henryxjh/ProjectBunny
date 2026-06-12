@@ -16,6 +16,7 @@
 static constexpr UINT MaxRootParameters = 64;
 static constexpr UINT MaxVertexBufferSlots = 32;
 static constexpr UINT MaxTrackedEvents = 20000;
+static constexpr UINT MaxDescriptorsPerRangeDump = 256;
 
 static void GetSummaryDirectory(const wchar_t *dir, wchar_t *path, size_t pathCount)
 {
@@ -32,13 +33,25 @@ struct RootTableState
 	D3D12_GPU_DESCRIPTOR_HANDLE baseDescriptor = {};
 };
 
+struct RootDescriptorState
+{
+	bool valid = false;
+	UINT rootParameterIndex = 0;
+	D3D12_ROOT_PARAMETER_TYPE type = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+};
+
 struct CommandListBindingState
 {
 	ID3D12PipelineState *pipelineState = nullptr;
+	ID3D12RootSignature *graphicsRootSignature = nullptr;
+	ID3D12RootSignature *computeRootSignature = nullptr;
 	ID3D12DescriptorHeap *cbvSrvUavHeap = nullptr;
 	ID3D12DescriptorHeap *samplerHeap = nullptr;
 	RootTableState graphicsTables[MaxRootParameters] = {};
 	RootTableState computeTables[MaxRootParameters] = {};
+	RootDescriptorState graphicsRootDescriptors[MaxRootParameters] = {};
+	RootDescriptorState computeRootDescriptors[MaxRootParameters] = {};
 	D3D12_VERTEX_BUFFER_VIEW vertexBuffers[MaxVertexBufferSlots] = {};
 	bool vertexBufferValid[MaxVertexBufferSlots] = {};
 	D3D12_INDEX_BUFFER_VIEW indexBuffer = {};
@@ -56,11 +69,15 @@ struct BindingEvent
 	UINT64 dispatchId = 0;
 	ID3D12GraphicsCommandList *commandList = nullptr;
 	ID3D12PipelineState *pipelineState = nullptr;
+	ID3D12RootSignature *graphicsRootSignature = nullptr;
+	ID3D12RootSignature *computeRootSignature = nullptr;
 	DX12PsoShaderInfo shaderInfo = {};
 	ID3D12DescriptorHeap *cbvSrvUavHeap = nullptr;
 	ID3D12DescriptorHeap *samplerHeap = nullptr;
 	RootTableState graphicsTables[MaxRootParameters] = {};
 	RootTableState computeTables[MaxRootParameters] = {};
+	RootDescriptorState graphicsRootDescriptors[MaxRootParameters] = {};
+	RootDescriptorState computeRootDescriptors[MaxRootParameters] = {};
 	D3D12_VERTEX_BUFFER_VIEW vertexBuffers[MaxVertexBufferSlots] = {};
 	bool vertexBufferValid[MaxVertexBufferSlots] = {};
 	D3D12_INDEX_BUFFER_VIEW indexBuffer = {};
@@ -104,17 +121,29 @@ static void StoreEventLocked(
 	event.dispatchId = isDispatchKind ? state.dispatchSerial : 0;
 	event.commandList = commandList;
 	event.pipelineState = state.pipelineState;
+	event.graphicsRootSignature = state.graphicsRootSignature;
+	event.computeRootSignature = state.computeRootSignature;
 	event.cbvSrvUavHeap = state.cbvSrvUavHeap;
 	event.samplerHeap = state.samplerHeap;
 	memcpy(event.graphicsTables, state.graphicsTables, sizeof(event.graphicsTables));
 	memcpy(event.computeTables, state.computeTables, sizeof(event.computeTables));
+	memcpy(event.graphicsRootDescriptors, state.graphicsRootDescriptors, sizeof(event.graphicsRootDescriptors));
+	memcpy(event.computeRootDescriptors, state.computeRootDescriptors, sizeof(event.computeRootDescriptors));
 	memcpy(event.vertexBuffers, state.vertexBuffers, sizeof(event.vertexBuffers));
 	memcpy(event.vertexBufferValid, state.vertexBufferValid, sizeof(event.vertexBufferValid));
 	event.indexBuffer = state.indexBuffer;
 	event.indexBufferValid = state.indexBufferValid;
 	event.primitiveTopology = state.primitiveTopology;
-	if (state.pipelineState)
+	if (state.pipelineState) {
 		DX12GetPipelineStateShaderInfo(state.pipelineState, &event.shaderInfo);
+		ID3D12RootSignature *psoRootSignature = nullptr;
+		if (DX12GetPsoRootSignature(event.shaderInfo.psoIndex, &psoRootSignature)) {
+			if (!event.graphicsRootSignature)
+				event.graphicsRootSignature = psoRootSignature;
+			if (!event.computeRootSignature)
+				event.computeRootSignature = psoRootSignature;
+		}
+	}
 	gEvents.push_back(event);
 }
 
@@ -149,6 +178,28 @@ void DX12BindingSetPipelineState(
 
 	AcquireSRWLockExclusive(&gBindingLock);
 	gCommandLists[commandList].pipelineState = pipelineState;
+	ReleaseSRWLockExclusive(&gBindingLock);
+}
+
+void DX12BindingSetGraphicsRootSignature(
+	ID3D12GraphicsCommandList *commandList, ID3D12RootSignature *rootSignature)
+{
+	if (!commandList)
+		return;
+
+	AcquireSRWLockExclusive(&gBindingLock);
+	gCommandLists[commandList].graphicsRootSignature = rootSignature;
+	ReleaseSRWLockExclusive(&gBindingLock);
+}
+
+void DX12BindingSetComputeRootSignature(
+	ID3D12GraphicsCommandList *commandList, ID3D12RootSignature *rootSignature)
+{
+	if (!commandList)
+		return;
+
+	AcquireSRWLockExclusive(&gBindingLock);
+	gCommandLists[commandList].computeRootSignature = rootSignature;
 	ReleaseSRWLockExclusive(&gBindingLock);
 }
 
@@ -343,6 +394,38 @@ void DX12BindingBeginFrame()
 	gGlobalDrawSerial = 0;
 	gGlobalDispatchSerial = 0;
 	gDroppedEvents = 0;
+	ReleaseSRWLockExclusive(&gBindingLock);
+}
+
+void DX12BindingSetGraphicsRootDescriptor(
+	ID3D12GraphicsCommandList *commandList, UINT rootParameterIndex,
+	D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address)
+{
+	if (!commandList || rootParameterIndex >= MaxRootParameters)
+		return;
+
+	AcquireSRWLockExclusive(&gBindingLock);
+	RootDescriptorState &descriptor = gCommandLists[commandList].graphicsRootDescriptors[rootParameterIndex];
+	descriptor.valid = address != 0;
+	descriptor.rootParameterIndex = rootParameterIndex;
+	descriptor.type = type;
+	descriptor.address = address;
+	ReleaseSRWLockExclusive(&gBindingLock);
+}
+
+void DX12BindingSetComputeRootDescriptor(
+	ID3D12GraphicsCommandList *commandList, UINT rootParameterIndex,
+	D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address)
+{
+	if (!commandList || rootParameterIndex >= MaxRootParameters)
+		return;
+
+	AcquireSRWLockExclusive(&gBindingLock);
+	RootDescriptorState &descriptor = gCommandLists[commandList].computeRootDescriptors[rootParameterIndex];
+	descriptor.valid = address != 0;
+	descriptor.rootParameterIndex = rootParameterIndex;
+	descriptor.type = type;
+	descriptor.address = address;
 	ReleaseSRWLockExclusive(&gBindingLock);
 }
 
@@ -938,42 +1021,83 @@ static void BuildDescriptorLookup(
 		(*descriptorsByCpuHandle)[descriptor.cpuHandle] = &descriptor;
 }
 
-static void WriteFrameResourceBinding(
-	FILE *file, const BindingEvent &event, const char *bindSpace,
-	const RootTableState &table, UINT heapType,
-	const std::vector<DX12DescriptorHeapSummary> &heaps,
-	const std::unordered_map<SIZE_T, const DX12DescriptorSummary*> &descriptorsByCpuHandle,
-	std::unordered_set<std::string> *seen)
+static UINT HeapTypeForDescriptorRange(UINT rangeType)
 {
-	if (!file || !table.valid || !seen)
-		return;
+	if (rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+		return D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+	return D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+}
 
-	const DX12DescriptorHeapSummary *heap = FindHeapForGpuHandle(heaps, table, heapType);
-	if (!heap)
-		return;
+static bool TableMatchesHeap(const RootTableState &table, const DX12DescriptorHeapSummary &heap)
+{
+	if (!table.valid || heap.increment == 0 || heap.gpuStart == 0)
+		return false;
+	const UINT64 begin = heap.gpuStart;
+	const UINT64 end = begin + static_cast<UINT64>(heap.numDescriptors) * heap.increment;
+	return table.baseDescriptor.ptr >= begin && table.baseDescriptor.ptr < end;
+}
 
-	const UINT64 descriptorIndex = (table.baseDescriptor.ptr - heap->gpuStart) / heap->increment;
-	const SIZE_T cpuHandle = heap->cpuStart + static_cast<SIZE_T>(descriptorIndex) * heap->increment;
-	const DX12DescriptorSummary *descriptor = FindDescriptorByCpuHandle(descriptorsByCpuHandle, cpuHandle);
+static const DX12DescriptorHeapSummary *FindHeapForTableRange(
+	const std::vector<DX12DescriptorHeapSummary> &heaps,
+	const RootTableState &table,
+	const DX12RootDescriptorRangeSummary *range,
+	UINT fallbackHeapType)
+{
+	const UINT requiredType = range ? HeapTypeForDescriptorRange(range->rangeType) : fallbackHeapType;
+	for (const DX12DescriptorHeapSummary &heap : heaps) {
+		if (heap.type != requiredType || !TableMatchesHeap(table, heap))
+			continue;
+		return &heap;
+	}
+	return nullptr;
+}
 
-	char key[256];
-	sprintf_s(key, "%llu|%s|%u|%p|%llu",
+static bool InsertBindingSeen(
+	std::unordered_set<std::string> *seen, const BindingEvent &event,
+	const char *bindSpace, UINT rootParameterIndex, UINT rangeIndex,
+	ID3D12DescriptorHeap *heap, UINT64 descriptorIndex, bool rootDescriptor)
+{
+	if (!seen)
+		return false;
+
+	char key[320];
+	sprintf_s(key, "%llu|%s|%u|%u|%p|%llu|%u|%llu",
 		static_cast<unsigned long long>(event.shaderInfo.psoIndex),
-		bindSpace,
-		table.rootParameterIndex,
-		heap->heap,
-		static_cast<unsigned long long>(descriptorIndex));
-	if (!seen->insert(key).second)
+		bindSpace ? bindSpace : "",
+		rootParameterIndex,
+		rangeIndex,
+		heap,
+		static_cast<unsigned long long>(descriptorIndex),
+		rootDescriptor ? 1 : 0,
+		static_cast<unsigned long long>(event.serial));
+	return seen->insert(key).second;
+}
+
+static void WriteDescriptorResourceRow(
+	FILE *file, const BindingEvent &event, const char *bindSpace,
+	UINT rootParameterIndex, UINT rangeIndex, UINT rangeType,
+	UINT shaderRegister, UINT registerSpace, UINT descriptorOffset,
+	const DX12DescriptorHeapSummary *heap, UINT64 descriptorIndex,
+	UINT64 gpuHandle, SIZE_T cpuHandle,
+	const DX12DescriptorSummary *descriptor)
+{
+	if (!file || !heap)
 		return;
 
-	fprintf(file, "%llu,%s,%u,%p,%s,%llu,0x%llx,0x%llx,0x%llx,",
+	fprintf(file, "%llu,%llu,%s,%u,%u,%u,%u,%u,%u,%p,%s,%llu,0x%llx,0x%llx,0x%llx,",
+		static_cast<unsigned long long>(event.serial),
 		static_cast<unsigned long long>(event.shaderInfo.psoIndex),
-		bindSpace,
-		table.rootParameterIndex,
+		bindSpace ? bindSpace : "",
+		rootParameterIndex,
+		rangeIndex,
+		rangeType,
+		shaderRegister,
+		registerSpace,
+		descriptorOffset,
 		heap->heap,
 		HeapTypeName(heap->type),
 		static_cast<unsigned long long>(descriptorIndex),
-		static_cast<unsigned long long>(table.baseDescriptor.ptr),
+		static_cast<unsigned long long>(gpuHandle),
 		static_cast<unsigned long long>(cpuHandle),
 		static_cast<unsigned long long>(heap->gpuStart));
 
@@ -1008,6 +1132,172 @@ static void WriteFrameResourceBinding(
 	}
 }
 
+static void WriteRootDescriptorResourceRow(
+	FILE *file, const BindingEvent &event, const char *bindSpace,
+	const RootDescriptorState &rootDescriptor,
+	const DX12RootParameterSummary *parameter,
+	const DX12BufferResourceSummary *resource)
+{
+	if (!file)
+		return;
+
+	const UINT shaderRegister = parameter ? parameter->shaderRegister : UINT_MAX;
+	const UINT registerSpace = parameter ? parameter->registerSpace : 0;
+	fprintf(file, "%llu,%llu,%s,%u,%u,%u,%u,%u,%u,%p,%s,%llu,0x%llx,0x%llx,0x%llx,",
+		static_cast<unsigned long long>(event.serial),
+		static_cast<unsigned long long>(event.shaderInfo.psoIndex),
+		bindSpace ? bindSpace : "",
+		rootDescriptor.rootParameterIndex,
+		UINT_MAX,
+		static_cast<UINT>(rootDescriptor.type),
+		shaderRegister,
+		registerSpace,
+		0,
+		static_cast<void*>(nullptr),
+		"ROOT_DESCRIPTOR",
+		0ull,
+		static_cast<unsigned long long>(rootDescriptor.address),
+		0ull,
+		0ull);
+
+	if (!resource || !resource->resource) {
+		fprintf(file, "root_%u,0,0,0,NONE,0,0,0,0,0,0,0x%llx,0\n",
+			static_cast<UINT>(rootDescriptor.type),
+			static_cast<unsigned long long>(rootDescriptor.address));
+		return;
+	}
+
+	const D3D12_RESOURCE_DESC &desc = resource->resourceDesc;
+	fprintf(file, "root_%u,%p,0,0,%s,%llu,%u,%u,%u,%u,0x%llx,0x%llx,0\n",
+		static_cast<UINT>(rootDescriptor.type),
+		resource->resource,
+		ResourceDimensionName(desc.Dimension),
+		static_cast<unsigned long long>(desc.Width),
+		desc.Height,
+		desc.DepthOrArraySize,
+		desc.MipLevels,
+		static_cast<UINT>(desc.Format),
+		static_cast<unsigned long long>(desc.Flags),
+		static_cast<unsigned long long>(resource->gpuVirtualAddress));
+}
+
+static const DX12RootParameterSummary *FindRootParameter(
+	const DX12RootSignatureSummary &rootSignature, UINT rootParameterIndex)
+{
+	for (const DX12RootParameterSummary &parameter : rootSignature.parameters) {
+		if (parameter.rootParameterIndex == rootParameterIndex)
+			return &parameter;
+	}
+	return nullptr;
+}
+
+static bool IsCompatibleRangeForSpace(const DX12RootDescriptorRangeSummary &range, const char *bindSpace)
+{
+	if (!bindSpace)
+		return true;
+	const bool samplerSpace = strstr(bindSpace, "sampler") != nullptr;
+	return samplerSpace == (range.rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+}
+
+static bool GetRootSignatureForEvent(
+	const BindingEvent &event, bool compute, DX12RootSignatureSummary *summary)
+{
+	if (!summary)
+		return false;
+	ID3D12RootSignature *rootSignature = compute ? event.computeRootSignature : event.graphicsRootSignature;
+	if (!rootSignature && event.shaderInfo.psoIndex)
+		DX12GetPsoRootSignature(event.shaderInfo.psoIndex, &rootSignature);
+	return rootSignature && DX12GetRootSignatureSummary(rootSignature, summary);
+}
+
+static void WriteFrameResourceBinding(
+	FILE *file, const BindingEvent &event, const char *bindSpace,
+	const RootTableState &table, UINT heapType,
+	const std::vector<DX12DescriptorHeapSummary> &heaps,
+	const std::unordered_map<SIZE_T, const DX12DescriptorSummary*> &descriptorsByCpuHandle,
+	std::unordered_set<std::string> *seen)
+{
+	if (!file || !table.valid || !seen)
+		return;
+
+	DX12RootSignatureSummary rootSignature;
+	const bool compute = bindSpace && !strncmp(bindSpace, "compute", 7);
+	const DX12RootParameterSummary *parameter = nullptr;
+	if (GetRootSignatureForEvent(event, compute, &rootSignature))
+		parameter = FindRootParameter(rootSignature, table.rootParameterIndex);
+
+	bool wroteRange = false;
+	if (parameter && parameter->parameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+		for (const DX12RootDescriptorRangeSummary &range : parameter->ranges) {
+			if (!IsCompatibleRangeForSpace(range, bindSpace))
+				continue;
+			const DX12DescriptorHeapSummary *heap = FindHeapForTableRange(heaps, table, &range, heapType);
+			if (!heap)
+				continue;
+			const UINT64 tableBaseIndex = (table.baseDescriptor.ptr - heap->gpuStart) / heap->increment;
+			UINT count = range.numDescriptors == UINT_MAX ? 1 : range.numDescriptors;
+			count = min(count, MaxDescriptorsPerRangeDump);
+			for (UINT offset = 0; offset < count; ++offset) {
+				const UINT64 descriptorIndex = tableBaseIndex + range.effectiveOffset + offset;
+				if (descriptorIndex >= heap->numDescriptors)
+					break;
+				const UINT64 gpuHandle = heap->gpuStart + descriptorIndex * heap->increment;
+				const SIZE_T cpuHandle = heap->cpuStart + static_cast<SIZE_T>(descriptorIndex) * heap->increment;
+				const DX12DescriptorSummary *descriptor = FindDescriptorByCpuHandle(descriptorsByCpuHandle, cpuHandle);
+				if (!InsertBindingSeen(seen, event, bindSpace, table.rootParameterIndex,
+						range.rangeIndex, heap->heap, descriptorIndex, false))
+					continue;
+				WriteDescriptorResourceRow(file, event, bindSpace, table.rootParameterIndex,
+					range.rangeIndex, range.rangeType, range.baseShaderRegister + offset,
+					range.registerSpace, range.effectiveOffset + offset, heap, descriptorIndex,
+					gpuHandle, cpuHandle, descriptor);
+				wroteRange = true;
+			}
+		}
+	}
+
+	if (wroteRange)
+		return;
+
+	const DX12DescriptorHeapSummary *heap = FindHeapForGpuHandle(heaps, table, heapType);
+	if (!heap)
+		return;
+
+	const UINT64 descriptorIndex = (table.baseDescriptor.ptr - heap->gpuStart) / heap->increment;
+	const SIZE_T cpuHandle = heap->cpuStart + static_cast<SIZE_T>(descriptorIndex) * heap->increment;
+	const DX12DescriptorSummary *descriptor = FindDescriptorByCpuHandle(descriptorsByCpuHandle, cpuHandle);
+	if (!InsertBindingSeen(seen, event, bindSpace, table.rootParameterIndex,
+			UINT_MAX, heap->heap, descriptorIndex, false))
+		return;
+	WriteDescriptorResourceRow(file, event, bindSpace, table.rootParameterIndex,
+		UINT_MAX, UINT_MAX, UINT_MAX, 0, 0, heap, descriptorIndex,
+		table.baseDescriptor.ptr, cpuHandle, descriptor);
+}
+
+static void WriteFrameRootDescriptor(
+	FILE *file, const BindingEvent &event, const char *bindSpace,
+	const RootDescriptorState &rootDescriptor,
+	std::unordered_set<std::string> *seen)
+{
+	if (!file || !rootDescriptor.valid || !seen)
+		return;
+
+	DX12RootSignatureSummary rootSignature;
+	const bool compute = bindSpace && !strncmp(bindSpace, "compute", 7);
+	const DX12RootParameterSummary *parameter = nullptr;
+	if (GetRootSignatureForEvent(event, compute, &rootSignature))
+		parameter = FindRootParameter(rootSignature, rootDescriptor.rootParameterIndex);
+
+	if (!InsertBindingSeen(seen, event, bindSpace, rootDescriptor.rootParameterIndex,
+			UINT_MAX, nullptr, rootDescriptor.address, true))
+		return;
+
+	DX12BufferResourceSummary resource;
+	const bool resolved = DX12ResolveBufferResourceByGpuVa(rootDescriptor.address, 1, &resource);
+	WriteRootDescriptorResourceRow(file, event, bindSpace, rootDescriptor,
+		parameter, resolved ? &resource : nullptr);
+}
+
 static void CollectFrameResourceBinding(
 	std::vector<DX12FrameResourceBinding> *bindings,
 	const BindingEvent &event, const char *bindSpace,
@@ -1019,6 +1309,66 @@ static void CollectFrameResourceBinding(
 	if (!bindings || !table.valid || !seen)
 		return;
 
+	DX12RootSignatureSummary rootSignature;
+	const bool compute = bindSpace && !strncmp(bindSpace, "compute", 7);
+	const DX12RootParameterSummary *parameter = nullptr;
+	if (GetRootSignatureForEvent(event, compute, &rootSignature))
+		parameter = FindRootParameter(rootSignature, table.rootParameterIndex);
+
+	bool collectedRange = false;
+	if (parameter && parameter->parameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+		for (const DX12RootDescriptorRangeSummary &range : parameter->ranges) {
+			if (!IsCompatibleRangeForSpace(range, bindSpace))
+				continue;
+			const DX12DescriptorHeapSummary *heap = FindHeapForTableRange(heaps, table, &range, heapType);
+			if (!heap)
+				continue;
+			const UINT64 tableBaseIndex = (table.baseDescriptor.ptr - heap->gpuStart) / heap->increment;
+			UINT count = range.numDescriptors == UINT_MAX ? 1 : range.numDescriptors;
+			count = min(count, MaxDescriptorsPerRangeDump);
+			for (UINT offset = 0; offset < count; ++offset) {
+				const UINT64 descriptorIndex = tableBaseIndex + range.effectiveOffset + offset;
+				if (descriptorIndex >= heap->numDescriptors)
+					break;
+				const UINT64 gpuHandle = heap->gpuStart + descriptorIndex * heap->increment;
+				const SIZE_T cpuHandle = heap->cpuStart + static_cast<SIZE_T>(descriptorIndex) * heap->increment;
+				const DX12DescriptorSummary *descriptor = FindDescriptorByCpuHandle(descriptorsByCpuHandle, cpuHandle);
+				if (!InsertBindingSeen(seen, event, bindSpace, table.rootParameterIndex,
+						range.rangeIndex, heap->heap, descriptorIndex, false))
+					continue;
+
+				DX12FrameResourceBinding binding;
+				binding.eventSerial = event.serial;
+				binding.drawId = event.drawId;
+				binding.dispatchId = event.dispatchId;
+				binding.psoIndex = event.shaderInfo.psoIndex;
+				binding.shaderInfo = event.shaderInfo;
+				binding.bindSpace = bindSpace ? bindSpace : "";
+				binding.rootParameterIndex = table.rootParameterIndex;
+				binding.rangeIndex = range.rangeIndex;
+				binding.rangeType = range.rangeType;
+				binding.shaderRegister = range.baseShaderRegister + offset;
+				binding.registerSpace = range.registerSpace;
+				binding.descriptorOffset = range.effectiveOffset + offset;
+				binding.heap = heap->heap;
+				binding.heapType = heap->type;
+				binding.descriptorIndex = descriptorIndex;
+				binding.gpuHandle = gpuHandle;
+				binding.cpuHandle = cpuHandle;
+				binding.heapGpuStart = heap->gpuStart;
+				if (descriptor) {
+					binding.descriptor = *descriptor;
+					binding.hasDescriptor = true;
+				}
+				bindings->push_back(std::move(binding));
+				collectedRange = true;
+			}
+		}
+	}
+
+	if (collectedRange)
+		return;
+
 	const DX12DescriptorHeapSummary *heap = FindHeapForGpuHandle(heaps, table, heapType);
 	if (!heap)
 		return;
@@ -1026,15 +1376,8 @@ static void CollectFrameResourceBinding(
 	const UINT64 descriptorIndex = (table.baseDescriptor.ptr - heap->gpuStart) / heap->increment;
 	const SIZE_T cpuHandle = heap->cpuStart + static_cast<SIZE_T>(descriptorIndex) * heap->increment;
 	const DX12DescriptorSummary *descriptor = FindDescriptorByCpuHandle(descriptorsByCpuHandle, cpuHandle);
-
-	char key[256];
-	sprintf_s(key, "%llu|%s|%u|%p|%llu",
-		static_cast<unsigned long long>(event.shaderInfo.psoIndex),
-		bindSpace,
-		table.rootParameterIndex,
-		heap->heap,
-		static_cast<unsigned long long>(descriptorIndex));
-	if (!seen->insert(key).second)
+	if (!InsertBindingSeen(seen, event, bindSpace, table.rootParameterIndex,
+			UINT_MAX, heap->heap, descriptorIndex, false))
 		return;
 
 	DX12FrameResourceBinding binding;
@@ -1055,6 +1398,41 @@ static void CollectFrameResourceBinding(
 		binding.descriptor = *descriptor;
 		binding.hasDescriptor = true;
 	}
+	bindings->push_back(std::move(binding));
+}
+
+static void CollectFrameRootDescriptorBinding(
+	std::vector<DX12FrameResourceBinding> *bindings,
+	const BindingEvent &event, const char *bindSpace,
+	const RootDescriptorState &rootDescriptor,
+	std::unordered_set<std::string> *seen)
+{
+	if (!bindings || !rootDescriptor.valid || !seen)
+		return;
+	if (!InsertBindingSeen(seen, event, bindSpace, rootDescriptor.rootParameterIndex,
+			UINT_MAX, nullptr, rootDescriptor.address, true))
+		return;
+
+	DX12RootSignatureSummary rootSignature;
+	const bool compute = bindSpace && !strncmp(bindSpace, "compute", 7);
+	const DX12RootParameterSummary *parameter = nullptr;
+	if (GetRootSignatureForEvent(event, compute, &rootSignature))
+		parameter = FindRootParameter(rootSignature, rootDescriptor.rootParameterIndex);
+
+	DX12FrameResourceBinding binding;
+	binding.eventSerial = event.serial;
+	binding.drawId = event.drawId;
+	binding.dispatchId = event.dispatchId;
+	binding.psoIndex = event.shaderInfo.psoIndex;
+	binding.shaderInfo = event.shaderInfo;
+	binding.bindSpace = bindSpace ? bindSpace : "";
+	binding.rootParameterIndex = rootDescriptor.rootParameterIndex;
+	binding.rangeIndex = UINT_MAX;
+	binding.rangeType = static_cast<UINT>(rootDescriptor.type);
+	binding.shaderRegister = parameter ? parameter->shaderRegister : UINT_MAX;
+	binding.registerSpace = parameter ? parameter->registerSpace : 0;
+	binding.rootDescriptor = true;
+	binding.gpuVirtualAddress = rootDescriptor.address;
 	bindings->push_back(std::move(binding));
 }
 
@@ -1098,6 +1476,10 @@ void DX12GetCurrentFrameResourceBindings(std::vector<DX12FrameResourceBinding> *
 			CollectFrameResourceBinding(bindings, event, "compute_sampler",
 				event.computeTables[i], D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
 				heaps, descriptorsByCpuHandle, &seen);
+			CollectFrameRootDescriptorBinding(bindings, event, "graphics_root",
+				event.graphicsRootDescriptors[i], &seen);
+			CollectFrameRootDescriptorBinding(bindings, event, "compute_root",
+				event.computeRootDescriptors[i], &seen);
 		}
 	}
 	DX12FrameAnalysisLogInfo("Binding resources stage: collected bindings=%zu unique=%zu\n",
@@ -1134,7 +1516,9 @@ static void WriteFrameResourceFile(const wchar_t *dir, const std::vector<Binding
 	fprintf(file, "events=%zu descriptor_heaps=%zu descriptors=%zu\n\n",
 		events.size(), heaps.size(), descriptors.size());
 	fprintf(file,
-		"pso,bind_space,root_param,heap,heap_type,descriptor_index,gpu_handle,cpu_handle,heap_gpu_start,descriptor_kind,resource,counter_resource,has_view_desc,resource_dimension,width,height,depth_or_array,mips,format,flags,gpu_va,view_dimension\n");
+		"event,pso,bind_space,root_param,range_index,range_type,shader_register,space,descriptor_offset,"
+		"heap,heap_type,descriptor_index,gpu_handle,cpu_handle,heap_gpu_start,descriptor_kind,resource,"
+		"counter_resource,has_view_desc,resource_dimension,width,height,depth_or_array,mips,format,flags,gpu_va,view_dimension\n");
 
 	std::unordered_set<std::string> seen;
 	size_t eventRows = 0;
@@ -1152,6 +1536,10 @@ static void WriteFrameResourceFile(const wchar_t *dir, const std::vector<Binding
 			WriteFrameResourceBinding(file, event, "compute_sampler",
 				event.computeTables[i], D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
 				heaps, descriptorsByCpuHandle, &seen);
+			WriteFrameRootDescriptor(file, event, "graphics_root",
+				event.graphicsRootDescriptors[i], &seen);
+			WriteFrameRootDescriptor(file, event, "compute_root",
+				event.computeRootDescriptors[i], &seen);
 		}
 		eventRows++;
 	}

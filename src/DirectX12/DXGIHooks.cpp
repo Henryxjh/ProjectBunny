@@ -224,16 +224,15 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain *swapChain, UINT s
 	DX12IncrementPresentCount();
 	DX12DrawSwapChainText(swapChain);
 	if (dumpFrame) {
-		DX12FrameAnalysisLogInfo("----- Frame analysis capture complete -----\n");
+		DX12FrameAnalysisLogEvent("FrameCaptureEnd present=%ld\n", DX12GetPresentCount());
 		DX12DumpFrameAnalysis();
-		DX12FrameAnalysisLogInfo("----- Frame analysis complete -----\n");
 		DX12FrameAnalysisEnd();
 	} else if (dumpShaders) {
 		DX12DumpCapturedFrameShaders();
 	} else if (DX12FrameAnalysisIsCaptureRequested()) {
 		DX12BindingBeginFrame();
 		DX12FrameAnalysisBeginCapture();
-		DX12FrameAnalysisLogInfo("----- Frame analysis capture started -----\n");
+		DX12FrameAnalysisLogEvent("FrameCaptureBegin present=%ld\n", DX12GetPresentCount());
 	} else if (DX12ShaderDumpIsCaptureRequested()) {
 		DX12BindingBeginFrame();
 		DX12ShaderDumpBeginCapture();
@@ -253,16 +252,15 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
 	DX12IncrementPresentCount();
 	DX12DrawSwapChainText(swapChain);
 	if (dumpFrame) {
-		DX12FrameAnalysisLogInfo("----- Frame analysis capture complete -----\n");
+		DX12FrameAnalysisLogEvent("FrameCaptureEnd present=%ld\n", DX12GetPresentCount());
 		DX12DumpFrameAnalysis();
-		DX12FrameAnalysisLogInfo("----- Frame analysis complete -----\n");
 		DX12FrameAnalysisEnd();
 	} else if (dumpShaders) {
 		DX12DumpCapturedFrameShaders();
 	} else if (DX12FrameAnalysisIsCaptureRequested()) {
 		DX12BindingBeginFrame();
 		DX12FrameAnalysisBeginCapture();
-		DX12FrameAnalysisLogInfo("----- Frame analysis capture started -----\n");
+		DX12FrameAnalysisLogEvent("FrameCaptureBegin present=%ld\n", DX12GetPresentCount());
 	} else if (DX12ShaderDumpIsCaptureRequested()) {
 		DX12BindingBeginFrame();
 		DX12ShaderDumpBeginCapture();
