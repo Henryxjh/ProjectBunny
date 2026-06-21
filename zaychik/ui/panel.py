@@ -7,9 +7,9 @@ from bpy.types import Panel, UIList
 
 from ..common.properties import ZAYCHIK_PG_frameanalysis_item
 from .operators import (
+    FrameAnalysisUI,
     ZAYCHIK_OT_import_dx12_dump,
     ZAYCHIK_OT_refresh_frameanalysis_list,
-    get_selected_frameanalysis_path,
 )
 
 
@@ -63,13 +63,26 @@ class ZAYCHIK_PT_sidebar(Panel):
         box.label(text="Status")
         box.label(text=settings.last_status)
 
-        selected_path = get_selected_frameanalysis_path(context)
+        selected_path = FrameAnalysisUI.selected_path(context)
         if selected_path:
             box.label(text=os.path.basename(selected_path))
 
 
 CLASSES = (
     ZAYCHIK_UL_frameanalysis_list,
-    ZAYCHIK_PT_sidebar, 
+    ZAYCHIK_PT_sidebar,
 )
+
+
+def register() -> None:
+    for klass in CLASSES:
+        bpy.utils.register_class(klass)
+
+
+def unregister() -> None:
+    for klass in reversed(CLASSES):
+        try:
+            bpy.utils.unregister_class(klass)
+        except (RuntimeError, ValueError):
+            pass
 

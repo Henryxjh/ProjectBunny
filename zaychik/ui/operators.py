@@ -1,65 +1,71 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import List, Optional
 
 import bpy
-from bpy.types import Operator
+from bpy.types import Context, Operator
 
-from ..utils.importer import import_draw_call
-from ..utils.parser import parse_draw_calls
-from ..utils.paths import normalize_path, scan_frameanalysis_directories
+from ..utils.importer import DrawImporter
+from ..utils.parser import LogParser
+from ..utils.paths import Paths
 
 
-def refresh_frameanalysis_items(context: bpy.types.Context) -> int:
-    """Re-scan the dump root directory and rebuild the FrameAnalysis list.
+class FrameAnalysisUI:
+    """Helpers shared by operators and by panel/init-time refresh.
 
-    Safe to call from non-draw contexts (operators, startup init). It writes
-    to ID data (CollectionProperty / IntProperty); the index update triggers
-    ``_on_frameanalysis_index_changed`` which keeps selected_frameanalysis_name
-    and Config.json in sync, so we do not write selected_frameanalysis_name nor
-    call save_config ourselves here.
+    All methods are @staticmethods because the helpers are stateless — they
+    read from ``context.scene.zaychik_settings`` and manipulate Blender data.
     """
-    settings = context.scene.zaychik_settings
-    root_dir = normalize_path(bpy.path.abspath(settings.dump_root_directory).strip())
-    selected_name = settings.selected_frameanalysis_name
 
-    settings.frameanalysis_items.clear()
+    @staticmethod
+    def refresh_items(context: Context) -> int:
+        """Re-scan the dump root directory and rebuild the FrameAnalysis list.
 
-    directories = scan_frameanalysis_directories(root_dir)
-    selected_index = 0
-    for index, (name, path) in enumerate(directories):
-        item = settings.frameanalysis_items.add()
-        item.name = name
-        item.path = path
-        if name == selected_name:
-            selected_index = index
+        Safe to call from non-draw contexts (operators, startup init). Writes
+        to CollectionProperty / IntProperty; the index update triggers
+        ``SettingsCallbacks.on_frameanalysis_index_changed`` which syncs
+        ``selected_frameanalysis_name`` and Config.json, so we do not set
+        ``selected_frameanalysis_name`` nor call ``ConfigManager.save_config``
+        ourselves.
+        """
+        settings = context.scene.zaychik_settings
+        root_dir = Paths.normalize(bpy.path.abspath(settings.dump_root_directory).strip())
+        selected_name = settings.selected_frameanalysis_name
 
-    if settings.frameanalysis_items:
-        # Assigning frameanalysis_index fires its update callback, which syncs
-        # selected_frameanalysis_name and saves Config.json.
-        settings.frameanalysis_index = min(selected_index, len(settings.frameanalysis_items) - 1)
-    else:
-        # No items: reset index (update callback will blank the name and save).
-        settings.frameanalysis_index = 0
+        settings.frameanalysis_items.clear()
 
-    return len(settings.frameanalysis_items)
+        directories = Paths.scan_frameanalysis_directories(root_dir)
+        selected_index = 0
+        for index, (name, path) in enumerate(directories):
+            item = settings.frameanalysis_items.add()
+            item.name = name
+            item.path = path
+            if name == selected_name:
+                selected_index = index
 
+        if settings.frameanalysis_items:
+            settings.frameanalysis_index = min(
+                selected_index, len(settings.frameanalysis_items) - 1
+            )
+        else:
+            settings.frameanalysis_index = 0
 
-def get_selected_frameanalysis_path(context: bpy.types.Context) -> str | None:
-    """Return the path of the currently selected FrameAnalysis, or None.
+        return len(settings.frameanalysis_items)
 
-    READ-ONLY. This is called from the panel draw() method, which is not
-    allowed to write to ID datablocks — do NOT modify any property here and
-    do NOT call save_config.
-    """
-    settings = context.scene.zaychik_settings
-    if not settings.frameanalysis_items:
-        return None
-    index = settings.frameanalysis_index
-    if index < 0 or index >= len(settings.frameanalysis_items):
-        return None
-    return settings.frameanalysis_items[index].path
+    @staticmethod
+    def selected_path(context: Context) -> Optional[str]:
+        """Return the path of the currently selected FrameAnalysis, or None.
+
+        READ-ONLY. Safe to call from ``panel.draw()`` (no ID writes).
+        """
+        settings = context.scene.zaychik_settings
+        if not settings.frameanalysis_items:
+            return None
+        index = settings.frameanalysis_index
+        if index < 0 or index >= len(settings.frameanalysis_items):
+            return None
+        return settings.frameanalysis_items[index].path
 
 
 class ZAYCHIK_OT_refresh_frameanalysis_list(Operator):
@@ -67,9 +73,9 @@ class ZAYCHIK_OT_refresh_frameanalysis_list(Operator):
     bl_label = "Refresh FrameAnalysis List"
     bl_description = "Scan the selected Win64 directory and list all FrameAnalysis folders"
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
+    def execute(self, context: Context) -> set[str]:
         settings = context.scene.zaychik_settings
-        root_dir = normalize_path(bpy.path.abspath(settings.dump_root_directory).strip())
+        root_dir = Paths.normalize(bpy.path.abspath(settings.dump_root_directory).strip())
         if not root_dir:
             self.report({"ERROR"}, "Please select the Win64 directory first")
             return {"CANCELLED"}
@@ -77,8 +83,10 @@ class ZAYCHIK_OT_refresh_frameanalysis_list(Operator):
             self.report({"ERROR"}, "Selected Win64 directory does not exist")
             return {"CANCELLED"}
 
-        count = refresh_frameanalysis_items(context)
-        context.scene.zaychik_settings.last_status = f"Found {count} FrameAnalysis folder(s)"
+        count = FrameAnalysisUI.refresh_items(context)
+        context.scene.zaychik_settings.last_status = (
+            f"Found {count} FrameAnalysis folder(s)"
+        )
         self.report({"INFO"}, context.scene.zaychik_settings.last_status)
         return {"FINISHED"}
 
@@ -86,17 +94,19 @@ class ZAYCHIK_OT_refresh_frameanalysis_list(Operator):
 class ZAYCHIK_OT_import_dx12_dump(Operator):
     bl_idname = "zaychik.import_dx12_dump"
     bl_label = "Analyze log.txt And Import"
-    bl_description = "Analyze log.txt in the selected dump directory and try importing model meshes"
+    bl_description = (
+        "Analyze log.txt in the selected dump directory and try importing model meshes"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
+    def execute(self, context: Context) -> set[str]:
         settings = context.scene.zaychik_settings
-        dump_dir = get_selected_frameanalysis_path(context)
+        dump_dir = FrameAnalysisUI.selected_path(context)
         if not dump_dir:
             self.report({"ERROR"}, "Please select a FrameAnalysis directory from the list")
             return {"CANCELLED"}
 
-        dump_dir = normalize_path(bpy.path.abspath(dump_dir).strip())
+        dump_dir = Paths.normalize(bpy.path.abspath(dump_dir).strip())
         log_path = os.path.join(dump_dir, "log.txt")
         if not os.path.isdir(dump_dir):
             self.report({"ERROR"}, "Dump directory does not exist")
@@ -106,16 +116,19 @@ class ZAYCHIK_OT_import_dx12_dump(Operator):
             return {"CANCELLED"}
 
         try:
-            draws = parse_draw_calls(log_path)
+            draws = LogParser.parse(log_path)
         except Exception as exc:  # pragma: no cover - Blender runtime path
             self.report({"ERROR"}, f"Failed to parse log.txt: {exc}")
             settings.last_status = "Parse failed"
             return {"CANCELLED"}
 
-        matching_draws = [draw for draw in draws if draw.index_binding and draw.vertex_bindings]
+        matching_draws = [
+            draw for draw in draws if draw.index_binding and draw.vertex_bindings
+        ]
         if settings.skin_source_filter != "all":
             matching_draws = [
-                draw for draw in matching_draws if draw.skin_source == settings.skin_source_filter
+                draw for draw in matching_draws
+                if draw.skin_source == settings.skin_source_filter
             ]
         if not matching_draws:
             self.report({"WARNING"}, "No usable indexed draw calls were found")
@@ -127,7 +140,7 @@ class ZAYCHIK_OT_import_dx12_dump(Operator):
         limit = min(settings.max_imports, len(matching_draws))
         for draw in matching_draws[:limit]:
             try:
-                ok, message = import_draw_call(context, dump_dir, draw)
+                ok, message = DrawImporter.import_draw_call(context, dump_dir, draw)
             except Exception as exc:  # pragma: no cover - Blender runtime path
                 ok = False
                 message = f"event {draw.event}: {exc}"
@@ -154,3 +167,15 @@ CLASSES = (
     ZAYCHIK_OT_import_dx12_dump,
 )
 
+
+def register() -> None:
+    for klass in CLASSES:
+        bpy.utils.register_class(klass)
+
+
+def unregister() -> None:
+    for klass in reversed(CLASSES):
+        try:
+            bpy.utils.unregister_class(klass)
+        except (RuntimeError, ValueError):
+            pass

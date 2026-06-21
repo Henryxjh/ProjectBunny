@@ -1,38 +1,21 @@
 """Vertex layout presets and matching logic.
 
-This is the "strict, not guessing" replacement for the old stride-only
-heuristic.  A :class:`VertexElement` declares one vertex attribute: its
-semantic name, DXGI format, byte offset within the stream, and which vertex
-buffer slot it lives in.  A :class:`StreamLayout` declares the full set of
-elements that live in one vertex buffer slot, along with the expected total
-stride.  A :class:`VertexFactory` is a complete vertex input layout (a set of
-stream layouts covering all slots used by a draw) plus friendly metadata.
-
-Matching is performed per-draw: a factory fits the draw only when every slot
-it declares is present with exactly the expected stride.  Slots the draw has
-but the factory does not declare are tolerated as "extra" streams (skinning
-constants, instance data, per-pass extras) so we do not reject a draw just
-because a tooling/pass-specific stream is attached.
-
-These factories reflect what we actually observe in UE5 Stellar Blade DX12
-captures.  As we encounter more engines/games we can grow the table; the
-matcher always picks the factory whose required slots cover the most of the
-draw's vertex streams (so richer, more-specific factories win over coarse
-fallbacks).
-
-Naming convention matches D3D11 semantic names (POSITION, NORMAL, TANGENT,
-TEXCOORD, COLOR, BLENDINDICES, BLENDWEIGHTS) so the importer can generically
-route them without hardcoding factory names.
+A :class:`VertexElement` declares one vertex attribute: semantic name, DXGI
+format, byte offset within the stream, and slot index.  A :class:`StreamLayout`
+declares the full set of elements that live in one vertex buffer slot along
+with the expected total stride.  A :class:`VertexFactory` is a complete input
+layout (a set of stream layouts covering all slots used by a draw) plus
+metadata and a :meth:`~VertexFactory.match` method.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
-from .formats import FormatInfo, get_format
+from .formats import DxgiFormat, FormatInfo
 
 
-# Standard semantic identifiers
+# Standard D3D semantic identifiers
 SEMANTIC_POSITION = "POSITION"
 SEMANTIC_NORMAL = "NORMAL"
 SEMANTIC_TANGENT = "TANGENT"
@@ -47,14 +30,14 @@ class VertexElement:
     """One element/attribute within a vertex stream."""
 
     semantic: str
-    semantic_index: int  # TEXCOORD0, TEXCOORD1, ...
-    format_name: str     # DXGI format name (e.g. "DXGI_FORMAT_R32G32B32_FLOAT")
-    offset: int          # byte offset within each vertex
-    slot: int            # vertex buffer slot
+    semantic_index: int
+    format_name: str
+    offset: int
+    slot: int
     format_info: FormatInfo = field(init=False)
 
     def __post_init__(self) -> None:
-        info = get_format(self.format_name)
+        info = DxgiFormat.get(self.format_name)
         if info is None:
             raise ValueError(f"Unknown DXGI format {self.format_name}")
         object.__setattr__(self, "format_info", info)
@@ -71,189 +54,195 @@ class StreamLayout:
     slot: int
     stride: int
     elements: Tuple[VertexElement, ...]
+    expected_format: Optional[str] = None
 
-    def matches_stride(self, actual_stride: int) -> bool:
-        return self.stride == actual_stride
+    def matches(self, actual_stride: int, actual_format: Optional[str]) -> bool:
+        if self.stride != actual_stride:
+            return False
+        if self.expected_format is None:
+            return True
+        if not actual_format or actual_format == "DXGI_FORMAT_UNKNOWN":
+            return True
+        return self.expected_format.upper() == actual_format.upper()
 
 
 @dataclass(frozen=True)
 class VertexFactory:
-    """A complete input layout: which slots hold which elements."""
+    """A complete input layout plus matching logic and the built-in UE5 presets.
+
+    All builder helpers (``make_element`` / ``make_stream``) are classmethods so
+    presets at module bottom construct themselves without free functions.
+    ``match()`` is also a classmethod that selects the best-scoring preset for
+    a given (slots, ib_format) pair.
+    """
 
     name: str
-    engine: str                   # e.g. "UE5", "generic"
-    category: str                 # "static", "skinned", "debug", ...
+    engine: str
+    category: str
     streams: Tuple[StreamLayout, ...]
-    # Index buffer format we expect, or None = accept any.
     index_format: Optional[str] = None
-    # Optional notes for debugging/UI
     notes: str = ""
+
+    # ----- Matching -----
 
     def required_slots(self) -> Dict[int, StreamLayout]:
         return {stream.slot: stream for stream in self.streams}
 
-    def score_for_draw(self, slot_strides: Dict[int, int],
+    def score_for_draw(self,
+                       slot_info: Dict[int, Tuple[int, Optional[str]]],
                        ib_format: Optional[str]) -> int:
-        """Return a match score >= 0; higher is better, 0 = does not fit.
-
-        Scores by the count of slots that match exactly. Factories that
-        declare more required slots rank higher if they all fit.
-        """
         required = self.required_slots()
         for slot, stream in required.items():
-            actual = slot_strides.get(slot)
-            if actual is None:
+            info = slot_info.get(slot)
+            if info is None:
                 return 0
-            if not stream.matches_stride(actual):
+            actual_stride, actual_fmt = info
+            if not stream.matches(actual_stride, actual_fmt):
                 return 0
         if self.index_format is not None and ib_format is not None and self.index_format != ib_format:
             return 0
         return len(required)
 
+    # ----- Preset registry -----
 
-# ---- UE5 factory presets ----------------------------------------------------
-#
-# UE5 Static Mesh / FStaticMeshVertexBuffer / FLocalVertexFactory observed
-# layouts.  Stellar Blade DX12 captures use per-component streams (Position in
-# one slot, packed TBN in another, UVs in another, color in another), which is
-# the UE "multiple streams" path.  Concrete slot assignments (0=pos, 1=TBN,
-# 2/3=misc, 4=UVs) are confirmed empirically from the dump.
+    _REGISTRY: Tuple["VertexFactory", ...] = ()
+
+    @classmethod
+    def register(cls, *factories: "VertexFactory") -> None:
+        cls._REGISTRY = factories
+
+    @classmethod
+    def registry(cls) -> Tuple["VertexFactory", ...]:
+        return cls._REGISTRY
+
+    @classmethod
+    def match(cls,
+              slot_info: Dict[int, Tuple[int, Optional[str]]],
+              ib_format: Optional[str]) -> Optional["VertexFactory"]:
+        """Pick the highest-scoring factory from the registry."""
+        best_score = 0
+        best_factory: Optional[VertexFactory] = None
+        for factory in cls._REGISTRY:
+            score = factory.score_for_draw(slot_info, ib_format)
+            if score > best_score:
+                best_score = score
+                best_factory = factory
+        return best_factory
+
+    # ----- Builder helpers for declaring presets -----
+
+    @staticmethod
+    def element(semantic: str, semantic_index: int, fmt: str,
+                slot: int, offset: int) -> VertexElement:
+        return VertexElement(semantic, semantic_index, fmt, offset, slot)
+
+    @staticmethod
+    def stream(slot: int, stride: int, *elements: VertexElement,
+               expected_format: Optional[str] = None) -> StreamLayout:
+        used = 0
+        for e in elements:
+            assert e.slot == slot, f"element slot {e.slot} != stream slot {slot}"
+            assert e.offset + e.byte_width <= stride, (
+                f"element {e.semantic}{e.semantic_index} @{e.offset} "
+                f"size {e.byte_width} overflows stream {slot} stride {stride}")
+            used = max(used, e.offset + e.byte_width)
+        assert used <= stride
+        return StreamLayout(slot, stride, elements, expected_format=expected_format)
 
 
-def _e(semantic: str, si: int, fmt: str, slot: int, offset: int) -> VertexElement:
-    return VertexElement(semantic, si, fmt, offset, slot)
+# ---------------------------------------------------------------------------
+# UE5 factory presets
+# ---------------------------------------------------------------------------
+E = VertexFactory.element
+S = VertexFactory.stream
 
-
-def _stream(slot: int, stride: int, *elements: VertexElement) -> StreamLayout:
-    # Sanity check: element offsets + sizes fit within stride.
-    used = 0
-    for e in elements:
-        assert e.slot == slot, f"element slot {e.slot} != stream slot {slot}"
-        assert e.offset + e.byte_width <= stride, (
-            f"element {e.semantic}{e.semantic_index} @{e.offset} size {e.byte_width} "
-            f"overflows stream {slot} stride {stride}")
-        used = max(used, e.offset + e.byte_width)
-    assert used <= stride
-    return StreamLayout(slot, stride, elements)
-
-
-#: UE5 static mesh, static (non-pose) path, position-only + TBN packed + color.
-#: Observed on clear/quad draws and many small static draws
-#:   slot0 stride=12 float3 POSITION
-#:   slot1 stride=4  R8G8B8A8_SNORM TANGENT (with normal coming from elsewhere or flat-shaded)
-#:   slot2 stride=4  R8G8B8A8_UNORM COLOR  (white/constant on many draws)
-#:   slot3 stride=4  R8G8B8A8_UNORM COLOR2 / mask (often 0xFFFFFFFF)
 UE5_STATIC_MINIMAL = VertexFactory(
     name="UE5.StaticMinimal",
     engine="UE5",
     category="static",
-    notes="Position-only static draws (UI quads, post, shadows) with packed TBN in single 4-byte stream.",
+    notes="Position-only static draws (UI quads, post, shadows) with packed TBN in 4-byte stream.",
     streams=(
-        _stream(0, 12, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-        _stream(1, 4, _e(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0)),
+        S(0, 12, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
+        S(1, 4,  E(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0)),
     ),
 )
 
-#: UE5 static mesh with TANGENT+NORMAL packed as two R8G8B8A8_SNORM in one 8-byte
-#: stream (the standard UE5 FStaticMeshVertexBuffer packed-TangentX-Normal layout).
-#:   slot0 stride=12  POSITION float3
-#:   slot1 stride=8   TANGENT snorm8x3 (off 0) + NORMAL snorm8x3 (off 4)
-#:   slot2 stride=4   COLOR/aux (not decoded semantically)
-#:   slot3 stride=4   aux/skinning mask
-#:   slot4 stride=16  TEXCOORD0..3 as half2 pairs (4 UVs @ 4 bytes each = 16 bytes)
 UE5_STATIC_FULL = VertexFactory(
     name="UE5.StaticFull",
     engine="UE5",
     category="static",
-    notes="UE5 static mesh: pos0 + packed TBN8 + aux streams + 4 half2 UVs.",
+    notes="UE5 static mesh: pos3f + packed TBN snorm8x8 + 4 half2 UVs.",
     streams=(
-        _stream(0, 12, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-        _stream(1, 8,
-                _e(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
-                _e(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
-        _stream(4, 16,
-                _e(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0),
-                _e(SEMANTIC_TEXCOORD, 1, "DXGI_FORMAT_R16G16_FLOAT", 4, 4),
-                _e(SEMANTIC_TEXCOORD, 2, "DXGI_FORMAT_R16G16_FLOAT", 4, 8),
-                _e(SEMANTIC_TEXCOORD, 3, "DXGI_FORMAT_R16G16_FLOAT", 4, 12)),
+        S(0, 12, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
+        S(1, 8,
+          E(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
+          E(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
+        S(4, 16,
+          E(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0),
+          E(SEMANTIC_TEXCOORD, 1, "DXGI_FORMAT_R16G16_FLOAT", 4, 4),
+          E(SEMANTIC_TEXCOORD, 2, "DXGI_FORMAT_R16G16_FLOAT", 4, 8),
+          E(SEMANTIC_TEXCOORD, 3, "DXGI_FORMAT_R16G16_FLOAT", 4, 12)),
     ),
 )
 
-#: Variant of UE5 static where UV stream is 8 bytes (only one half2 UV pair).
-#: Observed on smaller static props.
 UE5_STATIC_UV8 = VertexFactory(
     name="UE5.StaticUV8",
     engine="UE5",
     category="static",
-    notes="UE5 static mesh with single half2 UV stream.",
+    notes="UE5 static mesh with single half2 UV stream (stride 8).",
     streams=(
-        _stream(0, 12, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-        _stream(1, 8,
-                _e(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
-                _e(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
-        _stream(4, 8,
-                _e(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0)),
+        S(0, 12, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
+        S(1, 8,
+          E(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
+          E(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
+        S(4, 8, E(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0)),
     ),
 )
 
-#: Variant of UE5 static where TBN is in slot1 stride=4 (tangent only, no normal
-#: stream — e.g. shadow/depth passes that don't read normals).
 UE5_STATIC_TANGENT_ONLY = VertexFactory(
     name="UE5.StaticTangentOnly",
     engine="UE5",
     category="static",
-    notes="UE5 static path with 4-byte TANGENT stream, no NORMAL stream.",
+    notes="UE5 static path with 4-byte TANGENT stream, no NORMAL stream (depth/shadow).",
     streams=(
-        _stream(0, 12, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-        _stream(1, 4, _e(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0)),
-        _stream(4, 8, _e(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0)),
+        S(0, 12, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
+        S(1, 4,  E(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0)),
+        S(4, 8,  E(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0)),
     ),
 )
 
-#: GPU-preskinning skinned mesh layout where POSITION is in slot0 stride=12 (already
-#: skinned) and skin weights/indices have been consumed by the CS before the VS.
-#: Same stream geometry as StaticFull but tagged gpu_preskinning.
 UE5_GPU_SKINNED_FULL = VertexFactory(
     name="UE5.GPUSkinnedFull",
     engine="UE5",
     category="gpu_preskinning",
-    notes="GPU pre-skinned mesh with pos+TBN+4 UVs (post-skin pose).",
+    notes="GPU pre-skinned mesh: pos+TBN+4 UVs (post-skin pose, same streams as static).",
     streams=UE5_STATIC_FULL.streams,
 )
 
-#: GPU-pre-skinning variant where the position stream was written by the CS as
-#: 32-byte vertices (common for Eve's body/hair which use an expanded format).
-#: Until we decode the exact layout, we treat slot0 stride=32 as a Position stream
-#: whose first 12 bytes are float3 POSITION and the rest are unused/aux.
 UE5_GPU_SKINNED_EXPANDED = VertexFactory(
     name="UE5.GPUSkinnedExpanded",
     engine="UE5",
     category="gpu_preskinning",
     notes="GPU pre-skinned: slot0 stride=32 (first 12b = post-skin position).",
     streams=(
-        _stream(0, 32, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-        _stream(1, 8,
-                _e(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
-                _e(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
-        _stream(4, 16,
-                _e(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0),
-                _e(SEMANTIC_TEXCOORD, 1, "DXGI_FORMAT_R16G16_FLOAT", 4, 4),
-                _e(SEMANTIC_TEXCOORD, 2, "DXGI_FORMAT_R16G16_FLOAT", 4, 8),
-                _e(SEMANTIC_TEXCOORD, 3, "DXGI_FORMAT_R16G16_FLOAT", 4, 12)),
+        S(0, 32, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
+        S(1, 8,
+          E(SEMANTIC_TANGENT, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 0),
+          E(SEMANTIC_NORMAL, 0, "DXGI_FORMAT_R8G8B8A8_SNORM", 1, 4)),
+        S(4, 16,
+          E(SEMANTIC_TEXCOORD, 0, "DXGI_FORMAT_R16G16_FLOAT", 4, 0),
+          E(SEMANTIC_TEXCOORD, 1, "DXGI_FORMAT_R16G16_FLOAT", 4, 4),
+          E(SEMANTIC_TEXCOORD, 2, "DXGI_FORMAT_R16G16_FLOAT", 4, 8),
+          E(SEMANTIC_TEXCOORD, 3, "DXGI_FORMAT_R16G16_FLOAT", 4, 12)),
     ),
 )
 
-#: Generic fallback: slot 0 stride >= 12 with POSITION float3 at offset 0 (the
-#: remaining bytes in the vertex are ignored). This covers odd expanded formats
-#: and debug/helper draws that only expose position data.
 GENERIC_POSITION_ONLY_S12 = VertexFactory(
     name="Generic.PositionOnly",
     engine="generic",
     category="fallback",
-    notes="Fallback: slot0 stride 12 -> POSITION float3.",
-    streams=(
-        _stream(0, 12, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-    ),
+    notes="Fallback: slot0 stride 12 POSITION float3.",
+    streams=(S(0, 12, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),),
 )
 
 GENERIC_POSITION_ONLY_S16 = VertexFactory(
@@ -261,9 +250,7 @@ GENERIC_POSITION_ONLY_S16 = VertexFactory(
     engine="generic",
     category="fallback",
     notes="Fallback: slot0 stride 16, POSITION float3 at offset 0.",
-    streams=(
-        _stream(0, 16, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-    ),
+    streams=(S(0, 16, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),),
 )
 
 GENERIC_POSITION_ONLY_S32 = VertexFactory(
@@ -271,14 +258,12 @@ GENERIC_POSITION_ONLY_S32 = VertexFactory(
     engine="generic",
     category="fallback",
     notes="Fallback: slot0 stride 32, POSITION float3 at offset 0.",
-    streams=(
-        _stream(0, 32, _e(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),
-    ),
+    streams=(S(0, 32, E(SEMANTIC_POSITION, 0, "DXGI_FORMAT_R32G32B32_FLOAT", 0, 0)),),
 )
 
-
-# Order matters when scores tie: more specific factories first.
-FACTORIES: Tuple[VertexFactory, ...] = (
+# Order matters: more specific factories first so same-score ties pick the
+# richer definition.
+VertexFactory.register(
     UE5_STATIC_FULL,
     UE5_STATIC_UV8,
     UE5_STATIC_TANGENT_ONLY,
@@ -289,19 +274,3 @@ FACTORIES: Tuple[VertexFactory, ...] = (
     GENERIC_POSITION_ONLY_S16,
     GENERIC_POSITION_ONLY_S32,
 )
-
-
-def match_factory(slot_strides: Dict[int, int], ib_format: Optional[str]) -> Optional[VertexFactory]:
-    """Pick the best matching factory for a draw given its VB slot->stride map.
-
-    Returns the factory with the highest match score, or None if no factory
-    fits (which only happens if there is no stride-12 position stream).
-    """
-    best_score = 0
-    best_factory: Optional[VertexFactory] = None
-    for factory in FACTORIES:
-        score = factory.score_for_draw(slot_strides, ib_format)
-        if score > best_score:
-            best_score = score
-            best_factory = factory
-    return best_factory
