@@ -718,7 +718,7 @@ bool get_shader_model_from_bytecode(const void* data, size_t size, std::string* 
 }
 
 // Process groups that do not have patches to apply. Those can be handled without disassembly.
-bool link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required)
+void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required)
 {
 	ShaderRegexGroups::iterator i;
 	vector<uint32_t> match_ids;
@@ -758,8 +758,6 @@ bool link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::
 		// save_shader_regex_cache_bin to save the assembled binary.
 		save_shader_regex_cache_meta(hash, shader_type, &match_ids, false, nullptr, nullptr);
 	}
-
-	return match_ids.size() > 0;
 }
 
 bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline)

@@ -494,6 +494,7 @@ public:
 	int max_copies_per_frame;
 	unsigned frame_no;
 	int copies_this_frame;
+	int pool_index;
 
 	wstring filename;
 	bool substantiated;
@@ -543,6 +544,39 @@ private:
 typedef std::unordered_map<std::wstring, class CustomResource> CustomResources;
 extern CustomResources customResources;
 
+enum class PoolIndexType {
+	INVALID = -1,
+	RING,
+	FIFO
+};
+static EnumName_t<const wchar_t*, PoolIndexType> PoolIndexTypeNames[] = {
+	{L"ring", PoolIndexType::RING},
+	{L"fifo", PoolIndexType::FIFO},
+	{NULL, PoolIndexType::INVALID} // End of list marker
+};
+
+typedef std::unordered_map<float, size_t> CustomResourcePoolIndexMap;
+
+class CustomResourcePool {
+public:
+	wstring name;
+	CustomResource* resource_template = nullptr;
+
+	std::vector<CustomResource*> resources;
+	bool lazy_initialization = true;
+	PoolIndexType index_type = PoolIndexType::RING;
+
+	CustomResourcePoolIndexMap fifo_index_map;  // O(1) lookup of uid -> pool_index
+	std::vector<float> fifo_index_table;        // O(1) lookup of pool_index -> uid currently occupying slot
+	size_t last_fifo_index = 0;                 // Ring pointer for FIFO eviction
+
+	CustomResource* InitializeResource(int pool_index);
+	CustomResource* GetResource(float id);
+};
+
+typedef std::unordered_map<std::wstring, CustomResourcePool> CustomResourcePools;
+extern CustomResourcePools customResourcePools;
+
 // Forward declaration since TextureOverride also contains a command list
 struct TextureOverride;
 
@@ -563,29 +597,46 @@ enum class ResourceCopyTargetType {
 	CURSOR_MASK,
 	CURSOR_COLOR,
 	THIS_RESOURCE, // For constant buffer analysis & render/depth target clearing
+	CUSTOM_RESOURCE_POOL,
 	SWAP_CHAIN, // Meaning depends on whether or not upscaling has run yet this frame
 	REAL_SWAP_CHAIN, // need this for upscaling used with "r_bb"
 	FAKE_SWAP_CHAIN, // need this for upscaling used with "f_bb"
 	CPU, // For staging resources to the CPU
 };
 
+enum class ResourceCopyTargetEvaluationMode {
+	RESOURCE,
+	RESOURCE_IDENTITY,
+	POOL_IDENTITY,
+	POOL_SIZE,
+	POOL_INDEX,
+};
+
 class ResourceCopyTarget {
+private:
+	CustomResource* _custom_resource;  // Read access should go via GetCustomResource
 public:
 	ResourceCopyTargetType type;
+	ResourceCopyTargetEvaluationMode evaluation_mode;
 	wchar_t shader_type;
 	unsigned slot;
-	CustomResource *custom_resource;
+	CustomResourcePool *custom_resource_pool;
+	CommandListVariable* custom_resource_pool_index_var;
 	bool forbid_view_cache;
 
 	ResourceCopyTarget() :
 		type(ResourceCopyTargetType::INVALID),
+		evaluation_mode(ResourceCopyTargetEvaluationMode::RESOURCE),
 		shader_type(L'\0'),
 		slot(0),
-		custom_resource(NULL),
+		_custom_resource(NULL),
+		custom_resource_pool(NULL),
+		custom_resource_pool_index_var(NULL),
 		forbid_view_cache(false)
 	{}
 
-	bool ParseTarget(const wchar_t *target, bool is_source, const wstring *ini_namespace);
+	bool ParseTarget(const wchar_t *target, bool is_source, const wstring *ini_namespace, CommandListScope* scope);
+	CustomResource* GetCustomResource(bool static_evaluation = false);
 	ID3D11Resource *GetResource(CommandListState *state,
 			ID3D11View **view,
 			UINT *stride,
@@ -604,6 +655,8 @@ public:
 			CommandListState *state,
 			bool *resource_found,
 			TextureOverrideMatches *matches);
+	float GetResourceId(CommandListState* state);
+	float GetPoolId();
 	D3D11_BIND_FLAG BindFlags(CommandListState *state, D3D11_RESOURCE_MISC_FLAG *misc_flags=NULL);
 };
 
