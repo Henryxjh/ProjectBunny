@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "DX12Json.h"
 #include "DX12State.h"
 
 DX12FrameAnalysisState::DX12FrameAnalysisState() :
@@ -168,7 +169,7 @@ bool DX12FrameAnalysisState::OpenLogLocked()
 		return false;
 	}
 
-	fprintf(mLog, "{\"type\":\"header\",\"schema\":\"dx12-fa-log/2\",\"present_count_at_start\":%ld}\n", DX12GetPresentCount());
+	fprintf(mLog, "{\"index\":0,\"func\":\"Header\",\"schema\":\"dx12-fa-log/3\",\"present_count_at_start\":%ld}\n", DX12GetPresentCount());
 	return true;
 }
 
@@ -180,25 +181,7 @@ void DX12FrameAnalysisState::CloseLogLocked()
 	}
 }
 
-void DX12FrameAnalysisState::LogEvent(const char *fmt, ...)
-{
-	va_list args;
-
-	AcquireSRWLockExclusive(&mLock);
-	if (!mActive || !OpenLogLocked()) {
-		ReleaseSRWLockExclusive(&mLock);
-		return;
-	}
-
-	fprintf(mLog, "%06llu ", ++mLineNo);
-	va_start(args, fmt);
-	vfprintf(mLog, fmt, args);
-	va_end(args);
-	fflush(mLog);
-	ReleaseSRWLockExclusive(&mLock);
-}
-
-void DX12FrameAnalysisState::LogJsonLine(const char *json)
+void DX12FrameAnalysisState::LogJsonFields(const char *fields)
 {
 	AcquireSRWLockExclusive(&mLock);
 	if (!mActive || !OpenLogLocked()) {
@@ -206,8 +189,7 @@ void DX12FrameAnalysisState::LogJsonLine(const char *json)
 		return;
 	}
 
-	++mLineNo;
-	fprintf(mLog, "%s\n", json);
+	fprintf(mLog, "{\"index\":%llu,%s}\n", ++mLineNo, fields ? fields : "\"func\":\"Unknown\"");
 	fflush(mLog);
 	ReleaseSRWLockExclusive(&mLock);
 }
@@ -261,6 +243,8 @@ void DX12FrameAnalysisLogEvent(const char *fmt, ...)
 {
 	va_list args;
 	char buffer[1024];
+	char messageJson[1200];
+	char fields[1400];
 
 	if (!DX12FrameAnalysisIsActive())
 		return;
@@ -268,21 +252,32 @@ void DX12FrameAnalysisLogEvent(const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer), fmt, args);
 	va_end(args);
-	DX12FrameAnalysisState::Get().LogEvent("%s", buffer);
+
+	DX12JsonEscapeString(messageJson, sizeof(messageJson), buffer);
+	sprintf_s(fields, sizeof(fields), "\"func\":\"Event\",\"message\":%s", messageJson);
+	DX12FrameAnalysisLogJsonFields(fields);
 }
 
 void DX12FrameAnalysisLogInfo(const char *fmt, ...)
 {
 	va_list args;
 	char buffer[1024];
+	char messageJson[1200];
+	char fields[1400];
+
+	if (!DX12FrameAnalysisIsActive())
+		return;
 
 	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer), fmt, args);
 	va_end(args);
-	DX12Log("FrameAnalysis %s", buffer);
+
+	DX12JsonEscapeString(messageJson, sizeof(messageJson), buffer);
+	sprintf_s(fields, sizeof(fields), "\"func\":\"LogInfo\",\"message\":%s", messageJson);
+	DX12FrameAnalysisLogJsonFields(fields);
 }
 
-void DX12FrameAnalysisLogJsonLine(const char *json)
+void DX12FrameAnalysisLogJsonFields(const char *fields)
 {
-	DX12FrameAnalysisState::Get().LogJsonLine(json);
+	DX12FrameAnalysisState::Get().LogJsonFields(fields);
 }

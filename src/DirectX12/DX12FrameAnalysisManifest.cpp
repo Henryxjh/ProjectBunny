@@ -5,6 +5,7 @@
 #include <wchar.h>
 
 #include "DX12FrameAnalysis.h"
+#include "DX12Json.h"
 #include "DX12ShaderDump.h"
 
 static const char *ResourceDimensionName(D3D12_RESOURCE_DIMENSION dimension)
@@ -120,82 +121,17 @@ static void FormatFileHash(const wchar_t *filePath, char *hash, size_t hashCount
 	hash[i] = '\0';
 }
 
-static void JsonEscapeString(char *buf, size_t bufSize, const char *str)
+static const char *ApiFunctionName(const char *kind)
 {
-	if (!str || !buf || bufSize == 0) {
-		if (buf && bufSize > 0)
-			*buf = '\0';
-		return;
-	}
-	size_t pos = 0;
-	if (pos + 1 < bufSize)
-		buf[pos++] = '"';
-	for (; *str && pos + 6 < bufSize; ++str) {
-		switch (*str) {
-		case '"': buf[pos++] = '\\'; buf[pos++] = '"'; break;
-		case '\\': buf[pos++] = '\\'; buf[pos++] = '\\'; break;
-		case '\b': buf[pos++] = '\\'; buf[pos++] = 'b'; break;
-		case '\f': buf[pos++] = '\\'; buf[pos++] = 'f'; break;
-		case '\n': buf[pos++] = '\\'; buf[pos++] = 'n'; break;
-		case '\r': buf[pos++] = '\\'; buf[pos++] = 'r'; break;
-		case '\t': buf[pos++] = '\\'; buf[pos++] = 't'; break;
-		default:
-			if (static_cast<unsigned char>(*str) < 0x20) {
-				sprintf_s(buf + pos, bufSize - pos, "\\u%04x", static_cast<unsigned char>(*str));
-				pos += 6;
-			} else {
-				buf[pos++] = *str;
-			}
-		}
-	}
-	if (pos + 1 < bufSize)
-		buf[pos++] = '"';
-	if (pos < bufSize)
-		buf[pos] = '\0';
-}
-
-static void JsonEscapeWString(char *buf, size_t bufSize, const wchar_t *str)
-{
-	if (!buf || bufSize == 0)
-		return;
-	size_t pos = 0;
-	if (pos + 1 < bufSize)
-		buf[pos++] = '"';
-	if (!str) {
-		if (pos + 5 < bufSize) {
-			buf[pos++] = 'n';
-			buf[pos++] = 'u';
-			buf[pos++] = 'l';
-			buf[pos++] = 'l';
-		}
-	} else {
-		for (; *str && pos + 6 < bufSize; ++str) {
-			wchar_t c = *str;
-			if (c < 0x20) {
-				sprintf_s(buf + pos, bufSize - pos, "\\u%04x", static_cast<unsigned int>(c));
-				pos += 6;
-			} else if (c == L'"') {
-				buf[pos++] = '\\';
-				buf[pos++] = '"';
-			} else if (c == L'\\') {
-				buf[pos++] = '\\';
-				buf[pos++] = '\\';
-			} else if (c < 0x80) {
-				buf[pos++] = static_cast<char>(c);
-			} else if (c < 0x800 && pos + 2 < bufSize) {
-				buf[pos++] = static_cast<char>(0xC0 | (c >> 6));
-				buf[pos++] = static_cast<char>(0x80 | (c & 0x3F));
-			} else if (pos + 3 < bufSize) {
-				buf[pos++] = static_cast<char>(0xE0 | (c >> 12));
-				buf[pos++] = static_cast<char>(0x80 | ((c >> 6) & 0x3F));
-				buf[pos++] = static_cast<char>(0x80 | (c & 0x3F));
-			}
-		}
-	}
-	if (pos + 1 < bufSize && str)
-		buf[pos++] = '"';
-	if (pos < bufSize)
-		buf[pos] = '\0';
+	if (!kind)
+		return "Unknown";
+	if (!strcmp(kind, "draw_indexed"))
+		return "DrawIndexedInstanced";
+	if (!strcmp(kind, "draw"))
+		return "DrawInstanced";
+	if (!strcmp(kind, "dispatch"))
+		return "Dispatch";
+	return kind;
 }
 
 void DX12FrameAnalysisManifestWriteCall(
@@ -213,23 +149,20 @@ void DX12FrameAnalysisManifestWriteCall(
 	FormatShaderHash(shaderInfo.ps, shaderInfo.hasPS, ps, ARRAYSIZE(ps));
 	FormatShaderHash(shaderInfo.cs, shaderInfo.hasCS, cs, ARRAYSIZE(cs));
 
-	const bool isDispatch = functionName && !strcmp(functionName, "dispatch");
-
 	char functionJson[64], vsJson[64], psJson[64], csJson[64], topologyJson[32];
 	char cmdlistJson[32], psoJson[32];
-	JsonEscapeString(functionJson, sizeof(functionJson), functionName);
-	JsonEscapeString(vsJson, sizeof(vsJson), vs);
-	JsonEscapeString(psJson, sizeof(psJson), ps);
-	JsonEscapeString(csJson, sizeof(csJson), cs);
-	JsonEscapeString(topologyJson, sizeof(topologyJson), TopologyName(topology));
+	DX12JsonEscapeString(functionJson, sizeof(functionJson), ApiFunctionName(functionName));
+	DX12JsonEscapeString(vsJson, sizeof(vsJson), vs);
+	DX12JsonEscapeString(psJson, sizeof(psJson), ps);
+	DX12JsonEscapeString(csJson, sizeof(csJson), cs);
+	DX12JsonEscapeString(topologyJson, sizeof(topologyJson), TopologyName(topology));
 	sprintf_s(cmdlistJson, sizeof(cmdlistJson), "\"%p\"", commandList);
 	sprintf_s(psoJson, sizeof(psoJson), "\"%p\"", pipelineState);
 
 	char buffer[2048];
 	sprintf_s(buffer, sizeof(buffer),
-		"{\"type\":\"%s\","
-		"\"function\":%s,"
-		"\"event\":%llu,"
+		"\"func\":%s,"
+		"\"call_index\":%llu,"
 		"\"draw\":%llu,"
 		"\"dispatch\":%llu,"
 		"\"cmdlist\":%s,"
@@ -252,8 +185,7 @@ void DX12FrameAnalysisManifestWriteCall(
 		"\"ib_valid\":%s,"
 		"\"ib_gpu\":\"0x%llx\","
 		"\"ib_bytes\":%u,"
-		"\"ib_fmt\":%u}",
-		isDispatch ? "call.dispatch" : "call.draw",
+		"\"ib_fmt\":%u",
 		functionJson,
 		static_cast<unsigned long long>(eventSerial),
 		static_cast<unsigned long long>(drawId),
@@ -280,7 +212,7 @@ void DX12FrameAnalysisManifestWriteCall(
 		indexBufferValid ? indexBufferSize : 0,
 		indexBufferValid ? static_cast<UINT>(indexBufferFormat) : 0);
 
-	DX12FrameAnalysisLogJsonLine(buffer);
+	DX12FrameAnalysisLogJsonFields(buffer);
 }
 
 void DX12FrameAnalysisManifestWriteFileDump(
@@ -294,27 +226,27 @@ void DX12FrameAnalysisManifestWriteFileDump(
 
 	char statusJson[64], kindJson[16], hashJson[32], noteJson[128];
 	char fileJson[512], textJson[512];
-	JsonEscapeString(statusJson, sizeof(statusJson), status);
-	JsonEscapeString(kindJson, sizeof(kindJson), isTexture ? "texture" : "buffer");
-	JsonEscapeString(hashJson, sizeof(hashJson), hash);
-	JsonEscapeString(noteJson, sizeof(noteJson), note);
-	JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
+	DX12JsonEscapeString(statusJson, sizeof(statusJson), status);
+	DX12JsonEscapeString(kindJson, sizeof(kindJson), isTexture ? "texture" : "buffer");
+	DX12JsonEscapeString(hashJson, sizeof(hashJson), hash);
+	DX12JsonEscapeString(noteJson, sizeof(noteJson), note);
+	DX12JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
 	if (isTexture) {
 		strcpy_s(textJson, sizeof(textJson), "null");
 	} else {
-		JsonEscapeWString(textJson, sizeof(textJson), textPath);
+		DX12JsonEscapeWString(textJson, sizeof(textJson), textPath);
 	}
 
 	char buffer[1024];
 	sprintf_s(buffer, sizeof(buffer),
-		"{\"type\":\"file.dump\","
+		"\"func\":\"FileDump\","
 		"\"status\":%s,"
 		"\"kind\":%s,"
 		"\"file\":%s,"
 		"\"text\":%s,"
 		"\"hash\":%s,"
 		"\"bytes\":%llu,"
-		"\"note\":%s}",
+		"\"note\":%s",
 		statusJson,
 		kindJson,
 		fileJson,
@@ -323,7 +255,7 @@ void DX12FrameAnalysisManifestWriteFileDump(
 		static_cast<unsigned long long>(bytes),
 		noteJson);
 
-	DX12FrameAnalysisLogJsonLine(buffer);
+	DX12FrameAnalysisLogJsonFields(buffer);
 }
 
 void DX12FrameAnalysisManifestWriteIaBinding(
@@ -344,25 +276,25 @@ void DX12FrameAnalysisManifestWriteIaBinding(
 	char vsJson[64], psJson[64], csJson[64], producerCsJson[64];
 	char roleJson[32], dimJson[32], fmtNameJson[64], skinSourceJson[64];
 	char producerBindJson[64], hashJson[32], fileJson[512], resourceJson[32];
-	JsonEscapeString(vsJson, sizeof(vsJson), vs);
-	JsonEscapeString(psJson, sizeof(psJson), ps);
-	JsonEscapeString(csJson, sizeof(csJson), cs);
-	JsonEscapeString(producerCsJson, sizeof(producerCsJson), producerCs);
-	JsonEscapeString(roleJson, sizeof(roleJson), buffer.role.c_str());
-	JsonEscapeString(dimJson, sizeof(dimJson), ResourceDimensionName(desc.Dimension));
-	JsonEscapeString(fmtNameJson, sizeof(fmtNameJson), DxgiFormatName(buffer.format));
-	JsonEscapeString(skinSourceJson, sizeof(skinSourceJson),
+	DX12JsonEscapeString(vsJson, sizeof(vsJson), vs);
+	DX12JsonEscapeString(psJson, sizeof(psJson), ps);
+	DX12JsonEscapeString(csJson, sizeof(csJson), cs);
+	DX12JsonEscapeString(producerCsJson, sizeof(producerCsJson), producerCs);
+	DX12JsonEscapeString(roleJson, sizeof(roleJson), buffer.role.c_str());
+	DX12JsonEscapeString(dimJson, sizeof(dimJson), ResourceDimensionName(desc.Dimension));
+	DX12JsonEscapeString(fmtNameJson, sizeof(fmtNameJson), DxgiFormatName(buffer.format));
+	DX12JsonEscapeString(skinSourceJson, sizeof(skinSourceJson),
 		buffer.skinningClass.empty() ? "unknown" : buffer.skinningClass.c_str());
-	JsonEscapeString(producerBindJson, sizeof(producerBindJson),
+	DX12JsonEscapeString(producerBindJson, sizeof(producerBindJson),
 		buffer.producerBindSpace.empty() ? "-" : buffer.producerBindSpace.c_str());
-	JsonEscapeString(hashJson, sizeof(hashJson), hash);
-	JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
+	DX12JsonEscapeString(hashJson, sizeof(hashJson), hash);
+	DX12JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
 	sprintf_s(resourceJson, sizeof(resourceJson), "\"%p\"", buffer.resource.resource);
 
 	char buffer2[2048];
 	sprintf_s(buffer2, sizeof(buffer2),
-		"{\"type\":\"bind.ia\","
-		"\"event\":%llu,"
+		"\"func\":\"BindIA\","
+		"\"call_index\":%llu,"
 		"\"draw\":%llu,"
 		"\"dispatch\":%llu,"
 		"\"pso\":%llu,"
@@ -391,7 +323,7 @@ void DX12FrameAnalysisManifestWriteIaBinding(
 		"\"producer_root\":%u,"
 		"\"producer_reg\":%u,"
 		"\"file\":%s,"
-		"\"hash\":%s}",
+		"\"hash\":%s",
 		static_cast<unsigned long long>(buffer.eventSerial),
 		static_cast<unsigned long long>(buffer.drawId),
 		static_cast<unsigned long long>(buffer.dispatchId),
@@ -423,7 +355,7 @@ void DX12FrameAnalysisManifestWriteIaBinding(
 		fileJson,
 		hashJson);
 
-	DX12FrameAnalysisLogJsonLine(buffer2);
+	DX12FrameAnalysisLogJsonFields(buffer2);
 }
 
 void DX12FrameAnalysisManifestWriteResourceBinding(
@@ -451,21 +383,21 @@ void DX12FrameAnalysisManifestWriteResourceBinding(
 	char vsJson[64], psJson[64], csJson[64];
 	char bindJson[64], kindJson[32], dimJson[32], fmtNameJson[64];
 	char hashJson[32], fileJson[512], resourceJson[32];
-	JsonEscapeString(vsJson, sizeof(vsJson), vs);
-	JsonEscapeString(psJson, sizeof(psJson), ps);
-	JsonEscapeString(csJson, sizeof(csJson), cs);
-	JsonEscapeString(bindJson, sizeof(bindJson), binding.bindSpace.c_str());
-	JsonEscapeString(kindJson, sizeof(kindJson), descriptor.kind.c_str());
-	JsonEscapeString(dimJson, sizeof(dimJson), ResourceDimensionName(desc.Dimension));
-	JsonEscapeString(fmtNameJson, sizeof(fmtNameJson), DxgiFormatName(static_cast<UINT>(desc.Format)));
-	JsonEscapeString(hashJson, sizeof(hashJson), hash);
-	JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
+	DX12JsonEscapeString(vsJson, sizeof(vsJson), vs);
+	DX12JsonEscapeString(psJson, sizeof(psJson), ps);
+	DX12JsonEscapeString(csJson, sizeof(csJson), cs);
+	DX12JsonEscapeString(bindJson, sizeof(bindJson), binding.bindSpace.c_str());
+	DX12JsonEscapeString(kindJson, sizeof(kindJson), descriptor.kind.c_str());
+	DX12JsonEscapeString(dimJson, sizeof(dimJson), ResourceDimensionName(desc.Dimension));
+	DX12JsonEscapeString(fmtNameJson, sizeof(fmtNameJson), DxgiFormatName(static_cast<UINT>(desc.Format)));
+	DX12JsonEscapeString(hashJson, sizeof(hashJson), hash);
+	DX12JsonEscapeWString(fileJson, sizeof(fileJson), filePath);
 	sprintf_s(resourceJson, sizeof(resourceJson), "\"%p\"", descriptor.resource);
 
 	char buffer[2048];
 	sprintf_s(buffer, sizeof(buffer),
-		"{\"type\":\"bind.resource\","
-		"\"event\":%llu,"
+		"\"func\":\"BindResource\","
+		"\"call_index\":%llu,"
 		"\"draw\":%llu,"
 		"\"dispatch\":%llu,"
 		"\"pso\":%llu,"
@@ -497,7 +429,7 @@ void DX12FrameAnalysisManifestWriteResourceBinding(
 		"\"state\":\"0x%x\","
 		"\"state_known\":%s,"
 		"\"file\":%s,"
-		"\"hash\":%s}",
+		"\"hash\":%s",
 		static_cast<unsigned long long>(binding.eventSerial),
 		static_cast<unsigned long long>(binding.drawId),
 		static_cast<unsigned long long>(binding.dispatchId),
@@ -532,5 +464,5 @@ void DX12FrameAnalysisManifestWriteResourceBinding(
 		fileJson,
 		hashJson);
 
-	DX12FrameAnalysisLogJsonLine(buffer);
+	DX12FrameAnalysisLogJsonFields(buffer);
 }

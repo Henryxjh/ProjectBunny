@@ -93,9 +93,11 @@ if ($Platform -eq 'x64') {
 
         $dx12CleanupPaths = @(
             "$dx12TestDir\ShaderDumpDX12",
+            "$dx12TestDir\d3d12_log.jsonl",
             "$dx12TestDir\d3d12_log.txt",
             "$dx12TestDir\d3d12_hook.log"
         )
+        $dx12CleanupPaths += Get-ChildItem -Path $dx12TestDir -Filter "d3d12_log.before_*.jsonl" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
         $dx12CleanupPaths += Get-ChildItem -Path $dx12TestDir -Filter "d3d12_log.before_*.txt" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
         foreach ($cleanupPath in $dx12CleanupPaths) {
             if (Test-Path $cleanupPath) {

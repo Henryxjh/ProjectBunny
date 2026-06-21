@@ -89,9 +89,10 @@ class LogParser:
 
         for obj in cls._iter_json_lines(log_path):
             type_str = obj.get('type')
+            func = obj.get('func')
 
-            if type_str in ('call.draw', 'call.dispatch'):
-                event = obj.get('event', 0)
+            if func in ('DrawIndexedInstanced', 'DrawInstanced', 'Dispatch') or type_str in ('call.draw', 'call.dispatch'):
+                event = obj.get('call_index', obj.get('event', obj.get('index', 0)))
                 draws[event] = DrawCall(
                     event=event,
                     vs=obj.get('vs', '-'),
@@ -104,8 +105,8 @@ class LogParser:
                 )
                 continue
 
-            if type_str == 'bind.ia':
-                event = obj.get('event', 0)
+            if func == 'BindIA' or type_str == 'bind.ia':
+                event = obj.get('call_index', obj.get('event', 0))
                 draw = draws.get(event)
                 role = obj.get('role', '')
                 relative_path = obj.get('file', '')
@@ -143,8 +144,8 @@ class LogParser:
                         draw.index_binding = ib
                 continue
 
-            if type_str == 'bind.resource':
-                event = obj.get('event', 0)
+            if func == 'BindResource' or type_str == 'bind.resource':
+                event = obj.get('call_index', obj.get('event', 0))
                 draw = draws.get(event)
                 if draw is None:
                     continue

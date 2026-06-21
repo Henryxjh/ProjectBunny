@@ -5,10 +5,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "DX12Json.h"
 #include "Nektra/NktHookLib.h"
 
 static HINSTANCE gModule = nullptr;
 static FILE *gLog = nullptr;
+static unsigned long long gLogLineNo = 0;
 static volatile LONG gPresentCount = 0;
 static HWND gOverlayWindow = nullptr;
 static wchar_t gOverlayStatus[512] = L"3DMigoto DX12 hook alive";
@@ -35,8 +37,9 @@ bool DX12OpenLogFile()
 		return false;
 
 	PathRemoveFileSpecW(path);
-	PathAppendW(path, L"d3d12_log.txt");
+	PathAppendW(path, L"d3d12_log.jsonl");
 	gLog = _wfsopen(path, L"w", _SH_DENYNO);
+	gLogLineNo = 0;
 	return gLog != nullptr;
 }
 
@@ -54,9 +57,16 @@ void DX12Log(const char *fmt, ...)
 		return;
 
 	va_list args;
+	char message[2048];
+	char messageJson[2400];
+
 	va_start(args, fmt);
-	vfprintf(gLog, fmt, args);
+	vsnprintf(message, sizeof(message), fmt, args);
 	va_end(args);
+
+	DX12JsonEscapeString(messageJson, sizeof(messageJson), message);
+	fprintf(gLog, "{\"index\":%llu,\"func\":\"Log\",\"message\":%s}\n",
+		++gLogLineNo, messageJson);
 	fflush(gLog);
 }
 
