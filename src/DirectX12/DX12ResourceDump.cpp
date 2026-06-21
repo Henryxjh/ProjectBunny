@@ -14,6 +14,7 @@
 #include "crc32c.h"
 #include "DX12BindingTracker.h"
 #include "DX12FrameAnalysis.h"
+#include "DX12FrameAnalysisManifest.h"
 #include "DX12ShaderDump.h"
 #include "DX12State.h"
 
@@ -843,92 +844,25 @@ static void BuildFileName(const DumpTask &task, wchar_t *fileName, size_t fileNa
 		ext);
 }
 
-static void FormatShaderHash(UINT64 hash, bool hasHash, char *text, size_t textCount)
-{
-	if (!text || textCount == 0)
-		return;
-	if (hasHash)
-		sprintf_s(text, textCount, "%016llx", static_cast<unsigned long long>(hash));
-	else
-		sprintf_s(text, textCount, "-");
-}
-
 static void WriteIndexRow(
 	FILE *index, const char *status, const DumpTask &task, const D3D12_RESOURCE_DESC &desc,
 	UINT64 sourceOffset, UINT64 copyBytes, D3D12_RESOURCE_STATES sourceState,
-	bool hasCurrentState, const wchar_t *fileName, const char *note)
+	bool hasCurrentState, const wchar_t *semanticName, const wchar_t *filePath, const char *note)
 {
 	(void)index;
+	(void)status;
+	(void)semanticName;
+	(void)note;
 	if (task.sourceKind == DumpTaskSource::InputAssembler) {
-		const DX12FrameIaBufferBinding &buffer = task.iaBuffer;
-		const DX12BufferResourceSummary &resource = buffer.resource;
-		char vs[32], ps[32], cs[32];
-		FormatShaderHash(buffer.shaderInfo.vs, buffer.shaderInfo.hasVS, vs, ARRAYSIZE(vs));
-		FormatShaderHash(buffer.shaderInfo.ps, buffer.shaderInfo.hasPS, ps, ARRAYSIZE(ps));
-		FormatShaderHash(buffer.shaderInfo.cs, buffer.shaderInfo.hasCS, cs, ARRAYSIZE(cs));
-		DX12FrameAnalysisLogEvent(
-			"Resource status=%s event=%llu draw=%llu dispatch=%llu pso=%llu vs=%s ps=%s cs=%s ia=%s slot=%u resource=%p dim=%s gpu=0x%llx offset=%llu bytes=%llu state=0x%x stateKnown=%u file=%S note=%s\n",
-			status ? status : "",
-			static_cast<unsigned long long>(buffer.eventSerial),
-			static_cast<unsigned long long>(buffer.drawId),
-			static_cast<unsigned long long>(buffer.dispatchId),
-			static_cast<unsigned long long>(buffer.psoIndex),
-			vs, ps, cs,
-			buffer.role.c_str(),
-			buffer.slot,
-			resource.resource,
-			ResourceDimensionName(desc.Dimension),
-			static_cast<unsigned long long>(buffer.gpuVa),
-			static_cast<unsigned long long>(sourceOffset),
-			static_cast<unsigned long long>(copyBytes),
-			static_cast<UINT>(sourceState),
-			hasCurrentState ? 1 : 0,
-			fileName ? fileName : L"",
-			note ? note : "");
+		DX12FrameAnalysisManifestWriteIaBinding(
+			task.iaBuffer, desc, sourceOffset, copyBytes, sourceState,
+			hasCurrentState, filePath);
 		return;
 	}
 
-	DX12PsoShaderSummary shaders;
-	const bool hasShaders = DX12GetPsoShaderSummary(task.binding.psoIndex, &shaders);
-	char vs[32], ps[32], cs[32];
-	const bool hasVS = task.binding.shaderInfo.hasVS || (hasShaders && shaders.hasVS);
-	const bool hasPS = task.binding.shaderInfo.hasPS || (hasShaders && shaders.hasPS);
-	const bool hasCS = task.binding.shaderInfo.hasCS || (hasShaders && shaders.hasCS);
-	const UINT64 vsHash = task.binding.shaderInfo.hasVS ? task.binding.shaderInfo.vs : shaders.vs;
-	const UINT64 psHash = task.binding.shaderInfo.hasPS ? task.binding.shaderInfo.ps : shaders.ps;
-	const UINT64 csHash = task.binding.shaderInfo.hasCS ? task.binding.shaderInfo.cs : shaders.cs;
-	FormatShaderHash(vsHash, hasVS, vs, ARRAYSIZE(vs));
-	FormatShaderHash(psHash, hasPS, ps, ARRAYSIZE(ps));
-	FormatShaderHash(csHash, hasCS, cs, ARRAYSIZE(cs));
-
-	const DX12DescriptorSummary &descriptor = task.binding.descriptor;
-	DX12FrameAnalysisLogEvent(
-		"Resource status=%s event=%llu draw=%llu dispatch=%llu pso=%llu vs=%s ps=%s cs=%s bind=%s root=%u range=%u reg=%u space=%u desc=%llu kind=%s resource=%p dim=%s size=%llux%u fmt=%u gpu=0x%llx offset=%llu bytes=%llu state=0x%x stateKnown=%u file=%S note=%s\n",
-		status ? status : "",
-		static_cast<unsigned long long>(task.binding.eventSerial),
-		static_cast<unsigned long long>(task.binding.drawId),
-		static_cast<unsigned long long>(task.binding.dispatchId),
-		static_cast<unsigned long long>(task.binding.psoIndex),
-		vs, ps, cs,
-		task.binding.bindSpace.c_str(),
-		task.binding.rootParameterIndex,
-		task.binding.rangeIndex,
-		task.binding.shaderRegister,
-		task.binding.registerSpace,
-		static_cast<unsigned long long>(task.binding.descriptorIndex),
-		descriptor.kind.c_str(),
-		descriptor.resource,
-		ResourceDimensionName(desc.Dimension),
-		static_cast<unsigned long long>(desc.Width),
-		desc.Height,
-		static_cast<UINT>(desc.Format),
-		static_cast<unsigned long long>(descriptor.gpuVirtualAddress),
-		static_cast<unsigned long long>(sourceOffset),
-		static_cast<unsigned long long>(copyBytes),
-		static_cast<UINT>(sourceState),
-		hasCurrentState ? 1 : 0,
-		fileName ? fileName : L"",
-		note ? note : "");
+	DX12FrameAnalysisManifestWriteResourceBinding(
+		task.binding, desc, sourceOffset, copyBytes, sourceState,
+		hasCurrentState, filePath);
 }
 
 static bool ExecuteCopyBatch(
@@ -1245,10 +1179,11 @@ void DX12DumpCurrentFrameResources(const wchar_t *dir)
 	UINT failed = 0;
 	UINT linked = 0;
 	std::unordered_map<std::string, std::wstring> dedupePathByKey;
+	std::unordered_set<std::wstring> loggedFileDumps;
 	for (DumpTask &task : tasks) {
 		bool ok = task.copied;
+		std::wstring dedupePath;
 		if (ok) {
-			std::wstring dedupePath;
 			ok = MapAndWriteTask(dedupeDir, resourceDir, &task, &dedupePath);
 			if (ok && !task.dedupeKey.empty())
 				dedupePathByKey[task.dedupeKey] = dedupePath;
@@ -1261,54 +1196,35 @@ void DX12DumpCurrentFrameResources(const wchar_t *dir)
 		else
 			failed++;
 
-		WriteIndexRow(nullptr, ok ? "dumped" : "failed", task, task.desc,
+		if (!ok)
+			continue;
+
+		if (loggedFileDumps.insert(dedupePath).second) {
+			DX12FrameAnalysisManifestWriteFileDump(
+				dedupePath.c_str(), task.isTexture, task.copyBytes, "dumped", "");
+		}
+		WriteIndexRow(nullptr, "dumped", task, task.desc,
 			task.sourceOffset, task.copyBytes, task.sourceState, task.stateKnown,
-			ok ? task.fileName.c_str() : L"",
-			ok ? "" : (task.skipNote ? task.skipNote : "copy_failed_or_write_failed"));
+			task.fileName.c_str(), dedupePath.c_str(), "");
 	}
 
 	for (DumpTask &task : duplicateTasks) {
-		bool ok = false;
 		auto dedupeIt = dedupePathByKey.find(task.dedupeKey);
-		if (dedupeIt != dedupePathByKey.end())
-			ok = LinkTaskToDedupedFile(resourceDir, task, dedupeIt->second);
-		if (ok)
-			linked++;
-		else
+		if (dedupeIt == dedupePathByKey.end()) {
 			failed++;
+			continue;
+		}
 
-		WriteIndexRow(nullptr, ok ? "linked" : "failed", task, task.desc,
+		linked++;
+		WriteIndexRow(nullptr, "linked", task, task.desc,
 			task.sourceOffset, task.copyBytes, task.sourceState, task.stateKnown,
-			ok ? task.fileName.c_str() : L"",
-			ok ? "already_dumped_linked" : "already_dumped_link_failed");
+			task.fileName.c_str(), dedupeIt->second.c_str(), "already_dumped");
 	}
 
 	UINT skipped = 0;
 	for (const DumpTask &task : skippedTasks) {
+		(void)task;
 		skipped++;
-		if (task.sourceKind == DumpTaskSource::InputAssembler) {
-			D3D12_RESOURCE_DESC rowDesc = {};
-			if (task.iaBuffer.resource.hasResourceDesc)
-				rowDesc = task.iaBuffer.resource.resourceDesc;
-			WriteIndexRow(nullptr, "skipped", task, rowDesc,
-				task.iaBuffer.resource.resourceOffset,
-				task.iaBuffer.size,
-				static_cast<D3D12_RESOURCE_STATES>(task.iaBuffer.resource.hasCurrentState ?
-					task.iaBuffer.resource.currentState : 0),
-				task.iaBuffer.resource.hasCurrentState, L"",
-				task.skipNote ? task.skipNote : "unsupported_or_no_resource_pointer");
-			continue;
-		}
-		const DX12DescriptorSummary &descriptor = task.binding.descriptor;
-		const D3D12_RESOURCE_DESC &desc = descriptor.resourceDesc;
-		D3D12_RESOURCE_DESC rowDesc = {};
-		if (descriptor.hasResourceDesc)
-			rowDesc = desc;
-		WriteIndexRow(nullptr, "skipped", task, rowDesc,
-			descriptor.resourceOffset, descriptor.viewSize,
-			static_cast<D3D12_RESOURCE_STATES>(descriptor.hasCurrentState ? descriptor.currentState : 0),
-			descriptor.hasCurrentState, L"",
-			task.skipNote ? task.skipNote : "unsupported_or_no_resource_pointer");
 	}
 
 	ReleaseTasks(&tasks);
@@ -1316,7 +1232,7 @@ void DX12DumpCurrentFrameResources(const wchar_t *dir)
 	queue->Release();
 
 	DX12FrameAnalysisLogEvent(
-		"ResourceDumpResult textures=%u buffers=%u linked=%u skipped=%u duplicates=%u failed=%u readbackBytes=%llu bindings=%zu ia=%zu\n",
+		"resource.summary textures=%u buffers=%u linked=%u skipped=%u duplicates=%u failed=%u readback_bytes=%llu bindings=%zu ia=%zu\n",
 		dumpedTextures, dumpedBuffers, linked, skipped, duplicates, failed,
 		static_cast<unsigned long long>(frameReadbackBytes),
 		bindings.size(), iaBuffers.size());

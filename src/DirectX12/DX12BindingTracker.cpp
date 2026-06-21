@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "DX12FrameAnalysis.h"
+#include "DX12FrameAnalysisManifest.h"
 #include "DX12ResourceTracker.h"
 #include "DX12ShaderDump.h"
 #include "DX12State.h"
@@ -1563,65 +1564,36 @@ void DX12DumpBindingTrace(const wchar_t *dir)
 	droppedEvents = gDroppedEvents;
 	ReleaseSRWLockShared(&gBindingLock);
 
-	wchar_t path[MAX_PATH];
-	wchar_t summaryDir[MAX_PATH];
-	GetSummaryDirectory(dir, summaryDir, ARRAYSIZE(summaryDir));
-	swprintf_s(path, L"%s\\BindingTraceDX12.txt", summaryDir);
-	FILE *file = _wfsopen(path, L"w", _SH_DENYNO);
-	if (!file)
-		return;
-
-	fprintf(file, "DX12 Current Frame Binding Trace\n");
-	fprintf(file, "================================\n");
-	fprintf(file, "events=%zu dropped=%llu max_events=%u\n\n",
-		events.size(),
-		static_cast<unsigned long long>(droppedEvents),
-		MaxTrackedEvents);
-
-	fprintf(file,
-		"serial,kind,draw_id,dispatch_id,command_list,pipeline_state,pso,vs,ps,cs,topology,vertex_count,index_count,start_vertex,start_index,base_vertex,instance_count,start_instance,groups_x,groups_y,groups_z,vb_slots,ib_gpu_va,ib_size,ib_format,cbv_srv_uav_heap,sampler_heap,graphics_tables,compute_tables\n");
 	DX12FrameAnalysisLogInfo(
 		"DX12 binding trace begin: events=%zu dropped=%llu max_events=%u\n",
 		events.size(), static_cast<unsigned long long>(droppedEvents),
 		MaxTrackedEvents);
 	for (const BindingEvent &event : events) {
-		fprintf(file, "%llu,%s,%llu,%llu,%p,%p,",
-			static_cast<unsigned long long>(event.serial),
-			event.kind.c_str(),
-			static_cast<unsigned long long>(event.drawId),
-			static_cast<unsigned long long>(event.dispatchId),
-			event.commandList,
-			event.pipelineState);
-		WriteShaderInfo(file, event.shaderInfo);
-		fprintf(file, ",%s,%u,%u,%u,%u,%d,%u,%u,%u,%u,%u,",
-			TopologyName(event.primitiveTopology),
-			event.vertexCountPerInstance,
-			event.indexCountPerInstance,
-			event.startVertexLocation,
-			event.startIndexLocation,
-			event.baseVertexLocation,
-			event.instanceCount,
-			event.startInstanceLocation,
-			event.threadGroupCountX,
-			event.threadGroupCountY,
-			event.threadGroupCountZ);
-		WriteVertexBufferSlots(file, event);
-		fprintf(file, ",");
-		if (event.indexBufferValid) {
-			fprintf(file, "0x%llx,%u,%u",
-				static_cast<unsigned long long>(event.indexBuffer.BufferLocation),
+		if (IsDrawEvent(event) || IsDispatchEvent(event)) {
+			DX12FrameAnalysisManifestWriteCall(
+				event.kind.c_str(),
+				event.serial,
+				event.drawId,
+				event.dispatchId,
+				event.commandList,
+				event.pipelineState,
+				event.shaderInfo,
+				event.primitiveTopology,
+				event.vertexCountPerInstance,
+				event.indexCountPerInstance,
+				event.startVertexLocation,
+				event.startIndexLocation,
+				event.baseVertexLocation,
+				event.instanceCount,
+				event.startInstanceLocation,
+				event.threadGroupCountX,
+				event.threadGroupCountY,
+				event.threadGroupCountZ,
+				event.indexBufferValid,
+				event.indexBuffer.BufferLocation,
 				event.indexBuffer.SizeInBytes,
-				static_cast<UINT>(event.indexBuffer.Format));
-		} else {
-			fprintf(file, ",,");
+				event.indexBuffer.Format);
 		}
-		fprintf(file, ",%p,%p,",
-			event.cbvSrvUavHeap,
-			event.samplerHeap);
-		WriteRootTables(file, event.graphicsTables);
-		fprintf(file, ",");
-		WriteRootTables(file, event.computeTables);
-		fprintf(file, "\n");
 
 		char vs[32], ps[32], cs[32];
 		FormatOptionalHashText(event.shaderInfo.hasVS, event.shaderInfo.vs, vs, ARRAYSIZE(vs));
@@ -1654,11 +1626,6 @@ void DX12DumpBindingTrace(const wchar_t *dir)
 			event.samplerHeap);
 	}
 
-	fclose(file);
 	DX12FrameAnalysisLogInfo("DX12 binding trace end: events=%zu dropped=%llu\n",
 		events.size(), static_cast<unsigned long long>(droppedEvents));
-	DX12FrameAnalysisLogInfo("Current-frame binding trace written: %S events=%zu dropped=%llu\n",
-		path, events.size(), static_cast<unsigned long long>(droppedEvents));
-	WriteFlatFrameAnalysisFiles(dir, events, droppedEvents);
-	WriteFrameResourceFile(dir, events);
 }

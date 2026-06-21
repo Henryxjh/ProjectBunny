@@ -169,6 +169,8 @@ bool DX12FrameAnalysisState::OpenLogLocked()
 	}
 
 	fprintf(mLog, "DX12 Frame Analysis\n");
+	fprintf(mLog, "schema: dx12-fa-log/1\n");
+	fprintf(mLog, "format: numbered records with record_type followed by key=value fields\n");
 	fprintf(mLog, "present_count_at_start: %ld\n", DX12GetPresentCount());
 	return true;
 }
