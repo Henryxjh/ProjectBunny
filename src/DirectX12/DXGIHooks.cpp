@@ -38,6 +38,7 @@ static PFN_PRESENT1 gOrigPresent1 = nullptr;
 static PFN_CREATE_DXGI_FACTORY gOrigCreateDXGIFactory = nullptr;
 static PFN_CREATE_DXGI_FACTORY gOrigCreateDXGIFactory1 = nullptr;
 static PFN_CREATE_DXGI_FACTORY2 gOrigCreateDXGIFactory2 = nullptr;
+static volatile LONG gPresentTraceCount = 0;
 
 static HRESULT WINAPI HookedCreateDXGIFactory(REFIID riid, void **factory);
 static HRESULT WINAPI HookedCreateDXGIFactory1(REFIID riid, void **factory);
@@ -56,6 +57,28 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForComposition(
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain *swapChain, UINT syncInterval, UINT flags);
 static HRESULT STDMETHODCALLTYPE HookedPresent1(
 	IDXGISwapChain1 *swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS *presentParameters);
+
+static void *GetVTableSlot(void *object, size_t slot)
+{
+	if (!object)
+		return nullptr;
+	void **vtable = *reinterpret_cast<void***>(object);
+	return vtable ? vtable[slot] : nullptr;
+}
+
+static PFN_PRESENT GetPresentOriginal(IDXGISwapChain *swapChain)
+{
+	void *target = GetVTableSlot(swapChain, 8);
+	auto original = reinterpret_cast<PFN_PRESENT>(DX12GetOriginalFunction(target));
+	return original ? original : gOrigPresent;
+}
+
+static PFN_PRESENT1 GetPresent1Original(IDXGISwapChain1 *swapChain)
+{
+	void *target = GetVTableSlot(swapChain, 22);
+	auto original = reinterpret_cast<PFN_PRESENT1>(DX12GetOriginalFunction(target));
+	return original ? original : gOrigPresent1;
+}
 
 static void HookSwapChain(IDXGISwapChain *swapChain)
 {
@@ -231,12 +254,24 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForComposition(
 
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain *swapChain, UINT syncInterval, UINT flags)
 {
+	LONG trace = InterlockedIncrement(&gPresentTraceCount);
+	if (trace <= 8) {
+		DX12LogJsonFunc("IDXGISwapChain::PresentEnter",
+			"\"swapchain\":\"%p\",\"sync\":%u,\"flags\":\"0x%x\"", swapChain, syncInterval, flags);
+	}
 	DX12PollInput();
 	const bool dumpFrame = DX12FrameAnalysisEndCapture();
 	const bool dumpShaders = DX12ShaderDumpEndCapture();
-	HRESULT hr = gOrigPresent(swapChain, syncInterval, flags);
+	PFN_PRESENT original = GetPresentOriginal(swapChain);
+	if (!original)
+		return DXGI_ERROR_INVALID_CALL;
+	HRESULT hr = original(swapChain, syncInterval, flags);
 	DX12IncrementPresentCount();
-	DX12DrawSwapChainText(swapChain);
+	if (trace <= 8) {
+		DX12LogJsonFunc("IDXGISwapChain::PresentLeave",
+			"\"swapchain\":\"%p\",\"hr\":\"0x%lx\",\"present\":%ld",
+			swapChain, hr, DX12GetPresentCount());
+	}
 	if (dumpFrame) {
 		DX12FrameAnalysisLogJsonFunc("FrameCaptureEnd",
 			"\"present\":%ld", DX12GetPresentCount());
@@ -261,12 +296,24 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain *swapChain, UINT s
 static HRESULT STDMETHODCALLTYPE HookedPresent1(
 	IDXGISwapChain1 *swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS *presentParameters)
 {
+	LONG trace = InterlockedIncrement(&gPresentTraceCount);
+	if (trace <= 8) {
+		DX12LogJsonFunc("IDXGISwapChain1::Present1Enter",
+			"\"swapchain\":\"%p\",\"sync\":%u,\"flags\":\"0x%x\"", swapChain, syncInterval, flags);
+	}
 	DX12PollInput();
 	const bool dumpFrame = DX12FrameAnalysisEndCapture();
 	const bool dumpShaders = DX12ShaderDumpEndCapture();
-	HRESULT hr = gOrigPresent1(swapChain, syncInterval, flags, presentParameters);
+	PFN_PRESENT1 original = GetPresent1Original(swapChain);
+	if (!original)
+		return DXGI_ERROR_INVALID_CALL;
+	HRESULT hr = original(swapChain, syncInterval, flags, presentParameters);
 	DX12IncrementPresentCount();
-	DX12DrawSwapChainText(swapChain);
+	if (trace <= 8) {
+		DX12LogJsonFunc("IDXGISwapChain1::Present1Leave",
+			"\"swapchain\":\"%p\",\"hr\":\"0x%lx\",\"present\":%ld",
+			swapChain, hr, DX12GetPresentCount());
+	}
 	if (dumpFrame) {
 		DX12FrameAnalysisLogJsonFunc("FrameCaptureEnd",
 			"\"present\":%ld", DX12GetPresentCount());
