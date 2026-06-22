@@ -148,6 +148,17 @@ static D3D12_RESOURCE_STATES GuessSourceState(const DX12FrameResourceBinding &bi
 	return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
 
+static const char *RootDescriptorKindName(UINT rangeType)
+{
+	if (rangeType == D3D12_ROOT_PARAMETER_TYPE_CBV)
+		return "CBV";
+	if (rangeType == D3D12_ROOT_PARAMETER_TYPE_SRV)
+		return "SRV";
+	if (rangeType == D3D12_ROOT_PARAMETER_TYPE_UAV)
+		return "UAV";
+	return "";
+}
+
 static D3D12_RESOURCE_STATES GuessIaBufferSourceState(const DX12FrameIaBufferBinding &buffer)
 {
 	if (buffer.role == "IB")
@@ -563,19 +574,37 @@ static bool MapAndWriteTask(
 
 static bool ShouldDumpBinding(const DX12FrameResourceBinding &binding)
 {
-	if (binding.dispatchId != 0 || binding.drawId == 0)
+	const bool isDispatch = binding.dispatchId != 0;
+	const bool isDraw = binding.drawId != 0;
+	if (!isDispatch && !isDraw)
 		return false;
-	if (binding.bindSpace != "graphics_cbv_srv_uav" && binding.bindSpace != "graphics_root")
+
+	const bool isGraphicsSpace =
+		binding.bindSpace == "graphics_cbv_srv_uav" ||
+		binding.bindSpace == "graphics_root";
+	const bool isComputeSpace =
+		binding.bindSpace == "compute_cbv_srv_uav" ||
+		binding.bindSpace == "compute_root";
+	if ((isDispatch && !isComputeSpace) || (!isDispatch && !isGraphicsSpace))
 		return false;
 	if (binding.rootDescriptor)
-		return binding.rangeType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
-			binding.gpuVirtualAddress != 0;
-	if (!binding.hasDescriptor || binding.descriptor.kind != "CBV")
+		return binding.gpuVirtualAddress != 0 &&
+			(binding.rangeType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+			 binding.rangeType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+			 binding.rangeType == D3D12_ROOT_PARAMETER_TYPE_UAV);
+	if (!binding.hasDescriptor)
 		return false;
-	if (!binding.descriptor.hasResourceDesc ||
-		binding.descriptor.resourceDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+	const bool isBufferResource =
+		binding.descriptor.hasResourceDesc &&
+		binding.descriptor.resourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+		binding.descriptor.resource != nullptr;
+	if (!isBufferResource)
 		return false;
-	return binding.descriptor.resource != nullptr;
+	if (isDispatch)
+		return binding.descriptor.kind == "CBV" ||
+			binding.descriptor.kind == "SRV" ||
+			binding.descriptor.kind == "UAV";
+	return binding.descriptor.kind == "CBV";
 }
 
 static bool CreateReadbackForTask(
@@ -662,7 +691,7 @@ static bool PrepareTask(
 		task->source = resource.resource;
 		task->desc = resource.resourceDesc;
 		task->binding.hasDescriptor = true;
-		task->binding.descriptor.kind = "CBV";
+		task->binding.descriptor.kind = RootDescriptorKindName(binding.rangeType);
 		task->binding.descriptor.resource = resource.resource;
 		task->binding.descriptor.resourceDesc = resource.resourceDesc;
 		task->binding.descriptor.hasResourceDesc = resource.hasResourceDesc;
@@ -799,6 +828,12 @@ static const char *ShortBindSpace(const std::string &bindSpace)
 
 static const char *ShortDescriptorKind(const std::string &kind)
 {
+	if (kind == "CBV")
+		return "cbv";
+	if (kind == "SRV")
+		return "srv";
+	if (kind == "UAV")
+		return "uav";
 	if (kind == "CONSTANT_BUFFER_VIEW")
 		return "cbv";
 	if (kind == "SHADER_RESOURCE_VIEW")
