@@ -36,6 +36,17 @@ class TraceDraw:
     topology: str
     index_count: int
     vertex_count: int
+    start_index: int
+    start_vertex: int
+    base_vertex: int
+    instance_count: int
+    start_instance: int
+    groups_x: int
+    groups_y: int
+    groups_z: int
+    ib_gpu: str
+    ib_bytes: int
+    ib_fmt: int
     resources: List[TraceResource]
 
 
@@ -262,6 +273,17 @@ class TraceBrowser:
                 topology=cls._to_str(obj.get("topology")),
                 index_count=cls._to_int(obj.get("index_count")),
                 vertex_count=cls._to_int(obj.get("vertex_count")),
+                start_index=cls._to_int(obj.get("start_index")),
+                start_vertex=cls._to_int(obj.get("start_vertex")),
+                base_vertex=cls._to_int(obj.get("base_vertex")),
+                instance_count=cls._to_int(obj.get("instance_count")),
+                start_instance=cls._to_int(obj.get("start_instance")),
+                groups_x=cls._to_int(obj.get("groups_x")),
+                groups_y=cls._to_int(obj.get("groups_y")),
+                groups_z=cls._to_int(obj.get("groups_z")),
+                ib_gpu=cls._to_str(obj.get("ib_gpu")),
+                ib_bytes=cls._to_int(obj.get("ib_bytes")),
+                ib_fmt=cls._to_int(obj.get("ib_fmt")),
                 resources=resources,
             )
             command_lists.setdefault(cmdlist, []).append(trace_draw)
@@ -370,6 +392,17 @@ class TraceBrowser:
                     topology="",
                     index_count=0,
                     vertex_count=0,
+                    start_index=0,
+                    start_vertex=0,
+                    base_vertex=0,
+                    instance_count=0,
+                    start_instance=0,
+                    groups_x=0,
+                    groups_y=0,
+                    groups_z=0,
+                    ib_gpu="",
+                    ib_bytes=0,
+                    ib_fmt=0,
                     resources=resources,
                 )
             )

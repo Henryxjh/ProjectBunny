@@ -143,6 +143,73 @@ class ZAYCHIK_PT_sidebar(Panel):
             box.label(text=os.path.basename(selected_path))
 
 
+class FrameAnalysisPanelUI:
+    @staticmethod
+    def selected_draw(context: bpy.types.Context):
+        settings = context.scene.zaychik_settings
+        if not settings.trace_draw_items:
+            return None
+        index = settings.trace_draw_index
+        if index < 0 or index >= len(settings.trace_draw_items):
+            return None
+        return settings.trace_draw_items[index]
+
+    @staticmethod
+    def draw_selected_draw_details(
+        layout: bpy.types.UILayout,
+        context: bpy.types.Context,
+    ) -> None:
+        draw = FrameAnalysisPanelUI.selected_draw(context)
+        if draw is None:
+            return
+
+        box = layout.box()
+        box.label(text="Draw Parameters")
+        box.label(text=f"func={draw.func} call={draw.draw} pso={draw.pso}")
+        if draw.shader and draw.shader != "-":
+            box.label(text=f"shader={draw.shader}")
+        if draw.func == "Dispatch":
+            box.label(text=f"groups={draw.groups_x}, {draw.groups_y}, {draw.groups_z}")
+            return
+
+        if draw.index_count:
+            box.label(
+                text=(
+                    f"index_count={draw.index_count} "
+                    f"start_index={draw.start_index} "
+                    f"base_vertex={draw.base_vertex}"
+                )
+            )
+            box.label(
+                text=(
+                    f"instance_count={draw.instance_count} "
+                    f"start_instance={draw.start_instance}"
+                )
+            )
+            if draw.ib_gpu:
+                box.label(
+                    text=(
+                        f"ib_gpu={draw.ib_gpu} "
+                        f"ib_bytes={draw.ib_bytes} "
+                        f"ib_fmt={draw.ib_fmt}"
+                    )
+                )
+            return
+
+        box.label(
+            text=(
+                f"vertex_count={draw.vertex_count} "
+                f"start_vertex={draw.start_vertex}"
+            )
+        )
+        box.label(
+            text=(
+                f"instance_count={draw.instance_count} "
+                f"start_instance={draw.start_instance}"
+            )
+        )
+
+
 class ZAYCHIK_PT_frameanalysis(Panel):
     bl_label = "FrameAnalysis"
     bl_idname = "ZAYCHIK_PT_frameanalysis"
@@ -177,6 +244,7 @@ class ZAYCHIK_PT_frameanalysis(Panel):
             "trace_draw_index",
             rows=5,
         )
+        FrameAnalysisPanelUI.draw_selected_draw_details(layout, context)
 
         layout.label(text="Resources")
         layout.template_list(

@@ -58,6 +58,17 @@ class ZAYCHIK_PG_trace_draw_item(PropertyGroup):
     pso: IntProperty(name="PSO")
     index_count: IntProperty(name="Index Count")
     vertex_count: IntProperty(name="Vertex Count")
+    start_index: IntProperty(name="Start Index")
+    start_vertex: IntProperty(name="Start Vertex")
+    base_vertex: IntProperty(name="Base Vertex")
+    instance_count: IntProperty(name="Instance Count")
+    start_instance: IntProperty(name="Start Instance")
+    groups_x: IntProperty(name="Groups X")
+    groups_y: IntProperty(name="Groups Y")
+    groups_z: IntProperty(name="Groups Z")
+    ib_gpu: StringProperty(name="IB GPU")
+    ib_bytes: IntProperty(name="IB Bytes")
+    ib_fmt: IntProperty(name="IB Format")
 
 
 class ZAYCHIK_PG_trace_command_list_item(PropertyGroup):

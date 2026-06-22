@@ -98,9 +98,34 @@ class FrameAnalysisUI:
             item.pso = draw.pso
             item.index_count = draw.index_count
             item.vertex_count = draw.vertex_count
+            item.start_index = draw.start_index
+            item.start_vertex = draw.start_vertex
+            item.base_vertex = draw.base_vertex
+            item.instance_count = draw.instance_count
+            item.start_instance = draw.start_instance
+            item.groups_x = draw.groups_x
+            item.groups_y = draw.groups_y
+            item.groups_z = draw.groups_z
+            item.ib_gpu = draw.ib_gpu
+            item.ib_bytes = draw.ib_bytes
+            item.ib_fmt = draw.ib_fmt
             shader_text = f" shader={draw.shader[:8]}" if draw.shader and draw.shader != "-" else ""
-            count_text = f" idx={draw.index_count}" if draw.index_count else f" vtx={draw.vertex_count}"
-            item.label = f"{draw.draw:06d} {draw.func}{shader_text}{count_text} res={len(draw.resources)}"
+            if draw.func == "Dispatch":
+                params = f" groups={draw.groups_x},{draw.groups_y},{draw.groups_z}"
+            elif draw.index_count:
+                params = (
+                    f" idx={draw.index_count}"
+                    f" start={draw.start_index}"
+                    f" base={draw.base_vertex}"
+                    f" inst={draw.instance_count}"
+                )
+            else:
+                params = (
+                    f" vtx={draw.vertex_count}"
+                    f" start={draw.start_vertex}"
+                    f" inst={draw.instance_count}"
+                )
+            item.label = f"{draw.draw:06d} {draw.func}{shader_text}{params} res={len(draw.resources)}"
 
     @staticmethod
     def populate_trace_command_lists(
