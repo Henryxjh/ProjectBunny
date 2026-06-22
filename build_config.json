@@ -4,12 +4,14 @@
     {
       "GameId": "001",
       "TargetExe": "C:\\SteamLibrary\\steamapps\\common\\StellarBladeDemo\\SB\\Binaries\\Win64\\SB-Win64-Shipping.exe",
+      "WorkingDirectory": "",
       "LaunchArguments": ""
     },
     {
       "GameId": "002",
       "TargetExe": "D:\\Softs\\miHoYo Launcher\\games\\ZenlessZoneZero Game\\ZenlessZoneZero.exe",
-      "LaunchArguments": "-d3d12"
+      "WorkingDirectory": "",
+      "LaunchArguments": "-use-d3d12"
     }
   ]
 }
