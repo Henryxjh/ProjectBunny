@@ -91,6 +91,7 @@ class ZAYCHIK_PG_trace_resource_item(PropertyGroup):
     offset: IntProperty(name="Offset")
     stride: IntProperty(name="Stride")
     fmt_name: StringProperty(name="Format")
+    skin_source: StringProperty(name="Skin Source")
     path: StringProperty(name="Path")
     target: StringProperty(name="Target")
     text_path: StringProperty(name="Text Path")

@@ -173,6 +173,7 @@ class FrameAnalysisUI:
             item.offset = resource.offset
             item.stride = resource.stride
             item.fmt_name = resource.fmt_name
+            item.skin_source = resource.skin_source
             item.path = resource.path
             item.target = resource.target
             item.text_path = resource.text_path

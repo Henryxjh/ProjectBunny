@@ -23,6 +23,45 @@ from .operators import (
 )
 
 
+def _compact_func(value: str) -> str:
+    if value == "DrawIndexedInstanced":
+        return "DrawIdxInst"
+    if value == "DrawInstanced":
+        return "DrawInst"
+    if value == "DrawIndexed":
+        return "DrawIdx"
+    if value == "Dispatch":
+        return "Dispatch"
+    return value.replace("Instanced", "Inst")
+
+
+def _compact_kind(value: str) -> str:
+    return {
+        "Index Buffer": "IB",
+        "Vertex Buffer": "VB",
+        "Constant Buffer": "CBV",
+        "Texture/SRV": "SRV",
+        "Resource": "Res",
+    }.get(value, value)
+
+
+def _compact_format(value: str) -> str:
+    if not value:
+        return "-"
+    text = value.removeprefix("DXGI_FORMAT_")
+    return text[:14] if len(text) > 14 else text
+
+
+def _compact_text(value: str, limit: int) -> str:
+    if not value:
+        return "-"
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    return f"{value[:limit - 1]}..."
+
+
 class ZAYCHIK_UL_frameanalysis_list(UIList):
     bl_idname = "ZAYCHIK_UL_frameanalysis_list"
 
@@ -60,28 +99,28 @@ class ZAYCHIK_UL_trace_draw_list(UIList):
         del context, data, icon, active_data, active_propname, index, flt_flag
         row = layout.row(align=True)
         row.label(text=item.name, icon="RESTRICT_SELECT_OFF")
-        split = row.split(factor=0.23, align=True)
-        split.label(text=item.func.replace("Instanced", "Inst"))
-        split = split.split(factor=0.14, align=True)
+        split = row.split(factor=0.18, align=True)
+        split.label(text=_compact_func(item.func))
+        split = split.split(factor=0.10, align=True)
         split.label(text=str(item.pso))
-        split = split.split(factor=0.17, align=True)
+        split = split.split(factor=0.14, align=True)
         split.label(text=item.shader[:8] if item.shader and item.shader != "-" else "-")
-        split = split.split(factor=0.16, align=True)
+        split = split.split(factor=0.13, align=True)
         if item.func == "Dispatch":
             split.label(text=f"{item.groups_x},{item.groups_y},{item.groups_z}")
         elif item.index_count:
             split.label(text=str(item.index_count))
         else:
             split.label(text=str(item.vertex_count))
-        split = split.split(factor=0.17, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text=str(item.start_index if item.index_count else item.start_vertex))
-        split = split.split(factor=0.16, align=True)
+        split = split.split(factor=0.11, align=True)
         split.label(text=str(item.base_vertex))
-        split = split.split(factor=0.18, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text=str(item.instance_count))
-        split = split.split(factor=0.22, align=True)
+        split = split.split(factor=0.14, align=True)
         split.label(text=str(item.ib_fmt) if item.ib_fmt else "-")
-        split = split.split(factor=0.34, align=True)
+        split = split.split(factor=0.22, align=True)
         split.label(text=str(item.ib_bytes) if item.ib_bytes else "-")
         split.label(text=str(item.resource_count))
 
@@ -122,18 +161,22 @@ class ZAYCHIK_UL_trace_resource_list(UIList):
     ) -> None:
         del context, data, icon, active_data, active_propname, index, flt_flag
         row = layout.row(align=True)
-        row.label(text=item.slot, icon="OUTLINER_DATA_MESH")
-        split = row.split(factor=0.16, align=True)
-        split.label(text=item.kind)
-        split = split.split(factor=0.24, align=True)
-        split.label(text=item.register or "-")
-        split = split.split(factor=0.22, align=True)
+        row.label(text=_compact_text(item.slot, 12), icon="OUTLINER_DATA_MESH")
+        split = row.split(factor=0.08, align=True)
+        split.label(text=_compact_kind(item.kind))
+        split = split.split(factor=0.16, align=True)
+        split.label(text=_compact_text(item.register, 10))
+        split = split.split(factor=0.13, align=True)
         split.label(text=item.hash[:8] if item.hash else "-")
-        split = split.split(factor=0.20, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text=str(item.bytes))
-        split = split.split(factor=0.28, align=True)
+        split = split.split(factor=0.16, align=True)
         split.label(text=str(item.offset))
+        split = split.split(factor=0.09, align=True)
         split.label(text=str(item.stride))
+        split = split.split(factor=0.28, align=True)
+        split.label(text=_compact_format(item.fmt_name))
+        split.label(text=_compact_text(item.skin_source, 10))
 
 
 class ZAYCHIK_PT_sidebar(Panel):
@@ -181,23 +224,23 @@ class FrameAnalysisPanelUI:
     def draw_table_header(layout: bpy.types.UILayout) -> None:
         row = layout.row(align=True)
         row.label(text="Call")
-        split = row.split(factor=0.23, align=True)
+        split = row.split(factor=0.18, align=True)
         split.label(text="Func")
-        split = split.split(factor=0.14, align=True)
+        split = split.split(factor=0.10, align=True)
         split.label(text="PSO")
-        split = split.split(factor=0.17, align=True)
+        split = split.split(factor=0.14, align=True)
         split.label(text="Shader")
-        split = split.split(factor=0.16, align=True)
+        split = split.split(factor=0.13, align=True)
         split.label(text="Count")
-        split = split.split(factor=0.17, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text="Start")
-        split = split.split(factor=0.16, align=True)
+        split = split.split(factor=0.11, align=True)
         split.label(text="Base")
-        split = split.split(factor=0.18, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text="Inst")
-        split = split.split(factor=0.22, align=True)
+        split = split.split(factor=0.14, align=True)
         split.label(text="IBFmt")
-        split = split.split(factor=0.34, align=True)
+        split = split.split(factor=0.22, align=True)
         split.label(text="IBBytes")
         split.label(text="Res")
 
@@ -205,17 +248,21 @@ class FrameAnalysisPanelUI:
     def draw_resource_header(layout: bpy.types.UILayout) -> None:
         row = layout.row(align=True)
         row.label(text="Slot")
-        split = row.split(factor=0.16, align=True)
+        split = row.split(factor=0.08, align=True)
         split.label(text="Kind")
-        split = split.split(factor=0.24, align=True)
+        split = split.split(factor=0.16, align=True)
         split.label(text="Bind")
-        split = split.split(factor=0.22, align=True)
+        split = split.split(factor=0.13, align=True)
         split.label(text="Hash")
-        split = split.split(factor=0.20, align=True)
+        split = split.split(factor=0.12, align=True)
         split.label(text="Bytes")
-        split = split.split(factor=0.28, align=True)
+        split = split.split(factor=0.16, align=True)
         split.label(text="Offset")
+        split = split.split(factor=0.09, align=True)
         split.label(text="Stride")
+        split = split.split(factor=0.28, align=True)
+        split.label(text="Format")
+        split.label(text="Source")
 
 class ZAYCHIK_PT_frameanalysis(Panel):
     bl_label = "FrameAnalysis"
@@ -268,12 +315,6 @@ class ZAYCHIK_PT_frameanalysis(Panel):
 
         resource = FrameAnalysisUI.selected_trace_resource(context)
         if resource:
-            if resource.summary:
-                summary_box = layout.box()
-                summary_box.label(text="Metadata")
-                for chunk in resource.summary.split("; ")[:4]:
-                    summary_box.label(text=chunk[:96])
-
             row = layout.row(align=True)
             row.operator(ZAYCHIK_OT_open_trace_resource.bl_idname, icon="FILE")
             row.operator(ZAYCHIK_OT_reveal_trace_resource.bl_idname, icon="FILE_FOLDER")

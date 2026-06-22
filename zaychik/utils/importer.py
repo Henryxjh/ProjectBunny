@@ -4,8 +4,9 @@ vertex/factory decoding.
 from __future__ import annotations
 
 import os
+import json
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 import bpy
 from mathutils import Matrix, Vector
@@ -36,6 +37,8 @@ class DrawImporter:
         "graphics_root",
         "graphics",
     })
+    _GLOBAL_CBV_CACHE: ClassVar[Dict[str, Set[str]]] = {}
+    _GLOBAL_CBV_USE_THRESHOLD = 8
 
     # ------------------------------------------------------------------
     # Binary IO
@@ -49,6 +52,41 @@ class DrawImporter:
     @classmethod
     def _resolve_path(cls, dump_dir: str, rel: str) -> str:
         return Paths.resolve_binding(dump_dir, rel)
+
+    @classmethod
+    def _global_cbv_hashes(cls, dump_dir: str) -> Set[str]:
+        dump_dir = os.path.normpath(dump_dir)
+        cached = cls._GLOBAL_CBV_CACHE.get(dump_dir)
+        if cached is not None:
+            return cached
+
+        log_path = os.path.join(dump_dir, "log.jsonl")
+        call_indices_by_hash: Dict[str, Set[int]] = {}
+        if os.path.isfile(log_path):
+            with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("func") != "BindResource" or obj.get("kind") != "CBV":
+                        continue
+                    hash_text = str(obj.get("hash") or "")
+                    if not hash_text:
+                        continue
+                    try:
+                        call_index = int(obj.get("call_index") or 0)
+                    except (TypeError, ValueError):
+                        call_index = 0
+                    call_indices_by_hash.setdefault(hash_text, set()).add(call_index)
+
+        global_hashes = {
+            hash_text
+            for hash_text, call_indices in call_indices_by_hash.items()
+            if len(call_indices) >= cls._GLOBAL_CBV_USE_THRESHOLD
+        }
+        cls._GLOBAL_CBV_CACHE[dump_dir] = global_hashes
+        return global_hashes
 
     # ------------------------------------------------------------------
     # Index buffer
@@ -202,19 +240,44 @@ class DrawImporter:
     def _score_world_matrix(matrix: Matrix) -> float:
         translation = matrix.to_translation()
         translation_len = translation.length
-        if translation_len > 10000.0:
-            return -1.0
         basis_lengths = [matrix.col[i].to_3d().length for i in range(3)]
-        if any(L < 1e-4 or L > 10000.0 for L in basis_lengths):
+        if any(L < 0.01 or L > 100.0 for L in basis_lengths):
+            return -1.0
+        basis = [matrix.col[i].to_3d() for i in range(3)]
+        normalized = []
+        for vector in basis:
+            n = vector.copy()
+            n.normalize()
+            normalized.append(n)
+        orthogonality_error = (
+            abs(normalized[0].dot(normalized[1])) +
+            abs(normalized[0].dot(normalized[2])) +
+            abs(normalized[1].dot(normalized[2]))
+        )
+        if orthogonality_error > 0.05:
             return -1.0
         det = matrix.to_3x3().determinant()
-        if abs(det) < 1e-8:
+        if abs(det) < 0.5 or abs(det) > 2.0:
             return -1.0
-        score = 0.0
+        if abs(matrix[3][3] - 1.0) > 0.001:
+            return -1.0
+
+        scale_error = sum(abs(L - 1.0) for L in basis_lengths)
+        determinant_error = abs(abs(det) - 1.0)
+        affine_error = (
+            abs(matrix[3][0]) +
+            abs(matrix[3][1]) +
+            abs(matrix[3][2])
+        )
+        if affine_error > 0.001:
+            return -1.0
+
+        score = 1000.0
+        score -= scale_error * 100.0
+        score -= orthogonality_error * 100.0
+        score -= determinant_error * 50.0
         if translation_len > 0.001:
-            score += 100.0
-        score += min(translation_len, 10000.0) / 10000.0
-        score -= sum(abs(L - 1.0) for L in basis_lengths)
+            score += min(translation_len, 1_000_000.0) / 1_000_000.0
         return score
 
     @staticmethod
@@ -250,8 +313,12 @@ class DrawImporter:
     def find_draw_world_matrix(cls, dump_dir: str, draw: DrawCall) -> Optional[Matrix]:
         best_score = -1.0
         best_matrix: Optional[Matrix] = None
+        global_cbv_hashes = cls._global_cbv_hashes(dump_dir)
         for binding in draw.constant_buffers:
             if not cls._is_graphics_cbv_binding(binding.bind_space):
+                continue
+            hash_text = os.path.basename(binding.relative_path).split("-", 1)[0]
+            if hash_text in global_cbv_hashes:
                 continue
             cbv_path = cls._resolve_path(dump_dir, binding.relative_path)
             if not os.path.isfile(cbv_path):
