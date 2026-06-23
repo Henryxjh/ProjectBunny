@@ -180,6 +180,13 @@ struct ResourceRecord
 	bool hasCurrentState = false;
 };
 
+struct BufferResolveCacheEntry
+{
+	UINT64 begin = 0;
+	UINT64 end = 0;
+	DX12BufferResourceSummary summary = {};
+};
+
 struct PsoRootRecord
 {
 	UINT64 psoIndex = 0;
@@ -196,6 +203,7 @@ static std::unordered_map<SIZE_T, size_t> gDescriptorByCpuHandle;
 static std::vector<PsoRootRecord> gPsoRoots;
 static std::vector<ResourceRecord> gResources;
 static std::unordered_map<ID3D12Resource*, size_t> gResourceByPtr;
+static std::unordered_map<UINT64, BufferResolveCacheEntry> gBufferResolveCache;
 static bool gCleanupRegistered = false;
 static UINT64 gResourcesRecordedFromCreate = 0;
 
@@ -372,6 +380,7 @@ static void RecordResource(
 		gResourceByPtr[canonical] = gResources.size();
 		gResources.push_back(record);
 	}
+	gBufferResolveCache.clear();
 	gResourcesRecordedFromCreate++;
 	ReleaseSRWLockExclusive(&gResourceLock);
 }
@@ -381,6 +390,7 @@ static void CleanupTrackedResources()
 	AcquireSRWLockExclusive(&gResourceLock);
 	gResources.clear();
 	gResourceByPtr.clear();
+	gBufferResolveCache.clear();
 	ReleaseSRWLockExclusive(&gResourceLock);
 }
 
@@ -1523,15 +1533,25 @@ bool DX12ResolveBufferResourceByGpuVa(
 		return false;
 
 	*summary = DX12BufferResourceSummary();
+	const UINT64 requestedEnd = gpuVirtualAddress + size;
 	bool resolved = false;
 	AcquireSRWLockShared(&gResourceLock);
+	auto cached = gBufferResolveCache.find(gpuVirtualAddress);
+	if (cached != gBufferResolveCache.end() &&
+	    requestedEnd <= cached->second.end) {
+		*summary = cached->second.summary;
+		summary->resourceOffset = gpuVirtualAddress - cached->second.begin;
+		summary->viewSize = size;
+		ReleaseSRWLockShared(&gResourceLock);
+		return true;
+	}
+
 	for (const ResourceRecord &resource : gResources) {
 		if (resource.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
 			resource.gpuVirtualAddress == 0 || resource.size == 0)
 			continue;
 		const UINT64 begin = resource.gpuVirtualAddress;
 		const UINT64 end = begin + resource.size;
-		const UINT64 requestedEnd = gpuVirtualAddress + size;
 		if (gpuVirtualAddress >= begin && requestedEnd <= end) {
 			summary->resource = resource.resource;
 			summary->resourceDesc = resource.desc;
@@ -1550,6 +1570,19 @@ bool DX12ResolveBufferResourceByGpuVa(
 		}
 	}
 	ReleaseSRWLockShared(&gResourceLock);
+
+	if (resolved) {
+		AcquireSRWLockExclusive(&gResourceLock);
+		BufferResolveCacheEntry entry;
+		entry.begin = summary->gpuVirtualAddress;
+		entry.end = summary->gpuVirtualAddress +
+			(summary->hasResourceDesc ? summary->resourceDesc.Width : summary->viewSize);
+		entry.summary = *summary;
+		entry.summary.resourceOffset = 0;
+		entry.summary.viewSize = entry.end - entry.begin;
+		gBufferResolveCache[gpuVirtualAddress] = entry;
+		ReleaseSRWLockExclusive(&gResourceLock);
+	}
 	return resolved;
 }
 

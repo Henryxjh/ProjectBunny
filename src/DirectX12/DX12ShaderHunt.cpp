@@ -68,6 +68,7 @@ struct HuntIaState
 
 static SRWLOCK gHuntLock = SRWLOCK_INIT;
 static bool gHuntingEnabled = false;
+static volatile LONG gHuntingActive = 0;
 static std::unordered_map<ID3D12GraphicsCommandList*, ID3D12PipelineState*> gCommandListPso;
 static std::unordered_map<ID3D12GraphicsCommandList*, HuntIaState> gCommandListIa;
 static StageSelection gVS;
@@ -454,10 +455,7 @@ bool DX12HuntGetIaHashes(
 
 bool DX12HuntIsEnabled()
 {
-	AcquireSRWLockShared(&gHuntLock);
-	bool enabled = gHuntingEnabled;
-	ReleaseSRWLockShared(&gHuntLock);
-	return enabled;
+	return gHuntingActive != 0;
 }
 
 bool DX12HuntShouldDrawOverlay()
@@ -470,6 +468,7 @@ void DX12HuntToggle()
 	AcquireSRWLockExclusive(&gHuntLock);
 	gHuntingEnabled = !gHuntingEnabled;
 	bool enabled = gHuntingEnabled;
+	InterlockedExchange(&gHuntingActive, enabled ? 1 : 0);
 	ReleaseSRWLockExclusive(&gHuntLock);
 
 	DX12Log("DX12 hunting toggled %s\n", enabled ? "on" : "off");

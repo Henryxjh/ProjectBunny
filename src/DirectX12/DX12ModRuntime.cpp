@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "DX12State.h"
 #include "DX12DeviceHooks.h"
@@ -22,6 +23,9 @@ static std::wstring gShaderFixesDir;
 static Bunny::ShaderOverrideMap gShaderOverrides;
 static Bunny::TextureOverrideMap gTextureOverrides;
 static UINT64 gReloadGeneration = 1;
+static volatile LONG gHasShaderOverrides = 0;
+static volatile LONG gHasTextureOverrides = 0;
+static std::unordered_map<uint64_t, bool> gIaSkipCache;
 
 enum class DX12PsoKind
 {
@@ -45,6 +49,9 @@ struct DX12StoredPso
 	std::vector<unsigned char> csBytecode;
 	ID3D12PipelineState *replacement = nullptr;
 	UINT64 replacementGeneration = 0;
+	bool skipDraw = false;
+	bool skipDispatch = false;
+	UINT64 skipGeneration = 0;
 };
 
 static std::unordered_map<ID3D12PipelineState*, DX12StoredPso> gPsoRecords;
@@ -196,6 +203,9 @@ void DX12ModRuntimeLoad(const wchar_t *configPath)
 	AcquireSRWLockExclusive(&gModLock);
 	gShaderOverrides.swap(shaderOverrides);
 	gTextureOverrides.swap(textureOverrides);
+	gIaSkipCache.clear();
+	InterlockedExchange(&gHasShaderOverrides, gShaderOverrides.empty() ? 0 : 1);
+	InterlockedExchange(&gHasTextureOverrides, gTextureOverrides.empty() ? 0 : 1);
 	gLoaded = true;
 	++gReloadGeneration;
 	for (auto &item : gPsoRecords) {
@@ -204,6 +214,7 @@ void DX12ModRuntimeLoad(const wchar_t *configPath)
 			item.second.replacement = nullptr;
 		}
 		item.second.replacementGeneration = 0;
+		item.second.skipGeneration = 0;
 	}
 	ReleaseSRWLockExclusive(&gModLock);
 
@@ -291,18 +302,17 @@ bool DX12ModHasShaderOverride(uint64_t hash)
 
 bool DX12ModHasActiveShaderOverrides()
 {
-	AcquireSRWLockShared(&gModLock);
-	bool active = !gShaderOverrides.empty();
-	ReleaseSRWLockShared(&gModLock);
-	return active;
+	return gHasShaderOverrides != 0;
 }
 
 bool DX12ModHasActiveTextureOverrides()
 {
-	AcquireSRWLockShared(&gModLock);
-	bool active = !gTextureOverrides.empty();
-	ReleaseSRWLockShared(&gModLock);
-	return active;
+	return gHasTextureOverrides != 0;
+}
+
+bool DX12ModHasAnyActiveOverrides()
+{
+	return gHasShaderOverrides != 0 || gHasTextureOverrides != 0;
 }
 
 static bool TextureOverrideHasSkipLocked(uint32_t hash, std::wstring *section)
@@ -315,10 +325,39 @@ static bool TextureOverrideHasSkipLocked(uint32_t hash, std::wstring *section)
 	return true;
 }
 
+static uint64_t MakeIaSkipCacheKey(uint32_t ibHash, const uint32_t *vbHashes, size_t vbHashCount)
+{
+	uint64_t hash = 14695981039346656037ull;
+	auto append = [&hash](const void *data, size_t size) {
+		const unsigned char *bytes = static_cast<const unsigned char*>(data);
+		for (size_t i = 0; i < size; ++i) {
+			hash ^= bytes[i];
+			hash *= 1099511628211ull;
+		}
+	};
+	append(&ibHash, sizeof(ibHash));
+	for (size_t i = 0; vbHashes && i < vbHashCount; ++i) {
+		if (!vbHashes[i])
+			continue;
+		append(&vbHashes[i], sizeof(vbHashes[i]));
+	}
+	return hash;
+}
+
 bool DX12ModShouldSkipIa(uint32_t ibHash, const uint32_t *vbHashes, size_t vbHashCount)
 {
-	if (!DX12ModHasActiveTextureOverrides())
+	if (gHasTextureOverrides == 0)
 		return false;
+
+	uint64_t cacheKey = MakeIaSkipCacheKey(ibHash, vbHashes, vbHashCount);
+	AcquireSRWLockShared(&gModLock);
+	auto cached = gIaSkipCache.find(cacheKey);
+	if (cached != gIaSkipCache.end()) {
+		bool skip = cached->second;
+		ReleaseSRWLockShared(&gModLock);
+		return skip;
+	}
+	ReleaseSRWLockShared(&gModLock);
 
 	bool skip = false;
 	uint32_t matchedHash = 0;
@@ -341,11 +380,11 @@ bool DX12ModShouldSkipIa(uint32_t ibHash, const uint32_t *vbHashes, size_t vbHas
 	}
 	ReleaseSRWLockShared(&gModLock);
 
-	if (skip) {
-		DX12LogJsonFunc("DX12TextureOverrideSkip",
-			"\"section\":\"%S\",\"hash\":\"%08x\"",
-			section.c_str(), matchedHash);
-	}
+	AcquireSRWLockExclusive(&gModLock);
+	if (gIaSkipCache.size() > 4096)
+		gIaSkipCache.clear();
+	gIaSkipCache[cacheKey] = skip;
+	ReleaseSRWLockExclusive(&gModLock);
 	return skip;
 }
 
@@ -375,19 +414,49 @@ static bool StoredPsoHasSkipLocked(const DX12StoredPso &record, bool dispatch)
 		 ShaderBytecodeHasSkipLocked(record.graphicsDesc.PS));
 }
 
+static void UpdateStoredPsoSkipLocked(DX12StoredPso *record)
+{
+	if (!record || record->skipGeneration == gReloadGeneration)
+		return;
+
+	record->skipDraw = false;
+	record->skipDispatch = false;
+	if (record->kind == DX12PsoKind::Compute) {
+		record->skipDispatch = ShaderBytecodeHasSkipLocked(record->computeDesc.CS);
+	} else {
+		record->skipDraw =
+			ShaderBytecodeHasSkipLocked(record->graphicsDesc.VS) ||
+			ShaderBytecodeHasSkipLocked(record->graphicsDesc.PS);
+	}
+	record->skipGeneration = gReloadGeneration;
+}
+
 bool DX12ModShouldSkipPipelineState(ID3D12PipelineState *pipelineState, bool dispatch)
 {
-	if (!pipelineState || !DX12ModHasActiveShaderOverrides())
+	if (!pipelineState || gHasShaderOverrides == 0)
 		return false;
 
 	bool skip = false;
 	AcquireSRWLockShared(&gModLock);
 	auto record = gPsoRecords.find(pipelineState);
-	if (record != gPsoRecords.end())
-		skip = StoredPsoHasSkipLocked(record->second, dispatch);
+	if (record != gPsoRecords.end()) {
+		if (record->second.skipGeneration == gReloadGeneration) {
+			skip = dispatch ? record->second.skipDispatch : record->second.skipDraw;
+			ReleaseSRWLockShared(&gModLock);
+			return skip;
+		}
+	}
 	ReleaseSRWLockShared(&gModLock);
-	if (skip)
-		return true;
+
+	AcquireSRWLockExclusive(&gModLock);
+	record = gPsoRecords.find(pipelineState);
+	if (record != gPsoRecords.end()) {
+		UpdateStoredPsoSkipLocked(&record->second);
+		skip = dispatch ? record->second.skipDispatch : record->second.skipDraw;
+		ReleaseSRWLockExclusive(&gModLock);
+		return skip;
+	}
+	ReleaseSRWLockExclusive(&gModLock);
 
 	DX12PsoShaderInfo info = {};
 	if (!DX12GetPipelineStateShaderInfo(pipelineState, &info))
@@ -525,7 +594,7 @@ static ID3D12PipelineState *CreateComputeReplacement(DX12StoredPso *record)
 
 ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pipelineState)
 {
-	if (!pipelineState || !DX12ModHasActiveShaderOverrides())
+	if (!pipelineState || gHasShaderOverrides == 0)
 		return nullptr;
 
 	DX12StoredPso createRecord;

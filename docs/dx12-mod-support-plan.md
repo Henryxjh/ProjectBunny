@@ -140,6 +140,18 @@ Completed:
   - turning hunting off disables shader/IB/VB hiding immediately;
   - selected hashes and armed categories are preserved while hunting is off;
   - turning hunting on again restores the previous selection and hiding state.
+- Reduced DX12 hot-path CPU overhead after in-game frame drop reports:
+  - removed per-draw skip JSON logging for shader and TextureOverride skips;
+  - cached active shader/TextureOverride presence as atomic flags instead of locking every draw;
+  - draw/dispatch hooks now avoid hunting record/skip work while hunting is off;
+  - IASetIndexBuffer/IASetVertexBuffers only compute hunting hashes when hunting is enabled or TextureOverrides are loaded.
+  - SetPipelineState only probes replacement PSOs when shader overrides are loaded;
+  - SetPipelineState only updates hunting PSO state when hunting is enabled;
+  - removed unused IASetVertexBuffers string formatting from the default path.
+- Added DX12 cache pass to reduce repeated CPU work:
+  - buffer GPU VA to resource-summary resolution is cached and invalidated when tracked resources change;
+  - PSO shader skip decisions are cached per reload generation;
+  - TextureOverride IA hash match results are cached for repeated IB/VB binding combinations.
 
 Build artifact copied by the project script:
 
@@ -329,7 +341,7 @@ handling = skip
 
 3. Press F10 in-game.
 4. Confirm the target draw/dispatch disappears.
-5. Confirm the log contains `DX12DrawSkipped` or `DX12DispatchSkipped`.
+5. Confirm the log contains `DX12ModRuntimeReload`; per-draw skip logging is intentionally disabled for performance.
 
 Manual Mods include test:
 

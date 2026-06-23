@@ -212,6 +212,16 @@ static bool ShouldTrackBindings()
 	return DX12FrameAnalysisIsCapturing() || DX12ShaderDumpIsCapturingFrame();
 }
 
+static bool ShouldTrackHuntIa()
+{
+	return DX12HuntIsEnabled() || DX12ModHasActiveTextureOverrides();
+}
+
+static bool ShouldTrackPsoState()
+{
+	return DX12HuntIsEnabled() || DX12ModHasActiveShaderOverrides();
+}
+
 static void RememberActivePipelineState(
 	ID3D12GraphicsCommandList *commandList, ID3D12PipelineState *pipelineState)
 {
@@ -236,6 +246,9 @@ static ID3D12PipelineState *GetActivePipelineState(ID3D12GraphicsCommandList *co
 
 static bool ShouldSkipIaForMod(ID3D12GraphicsCommandList *commandList)
 {
+	if (!DX12ModHasActiveTextureOverrides())
+		return false;
+
 	uint32_t ibHash = 0;
 	uint32_t vbHashes[32] = {};
 	size_t vbHashCount = 0;
@@ -580,8 +593,10 @@ static HRESULT STDMETHODCALLTYPE HookedResetCommandList(
 		" allocator=%p initialPso=%p", allocator, initialState);
 	if (ShouldTrackBindings())
 		DX12BindingResetCommandList(commandList, initialState);
-	RememberActivePipelineState(commandList, initialState);
-	DX12HuntResetCommandList(commandList, initialState);
+	if (ShouldTrackPsoState())
+		RememberActivePipelineState(commandList, initialState);
+	if (ShouldTrackPsoState() || ShouldTrackHuntIa())
+		DX12HuntResetCommandList(commandList, initialState);
 	PFN_RESET_COMMAND_LIST original = DX12_CL_ORIG(commandList, 10, PFN_RESET_COMMAND_LIST, ResetCommandList);
 	return original ? original(commandList, allocator, initialState) : E_FAIL;
 }
@@ -607,17 +622,16 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
 	if (ShouldTrackBindings())
 		DX12BindingRecordDrawInstanced(commandList, vertexCountPerInstance, instanceCount,
 			startVertexLocation, startInstanceLocation);
-	DX12HuntRecordDraw(commandList);
-	if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false)) {
-		DX12LogJsonFunc("DX12DrawSkipped", "\"kind\":\"DrawInstanced\",\"reason\":\"mod_shader_skip\"");
-		return;
+	if (DX12HuntIsEnabled()) {
+		DX12HuntRecordDraw(commandList);
+		if (DX12HuntShouldSkipDraw(commandList))
+			return;
 	}
-	if (ShouldSkipIaForMod(commandList)) {
-		DX12LogJsonFunc("DX12DrawSkipped", "\"kind\":\"DrawInstanced\",\"reason\":\"mod_texture_skip\"");
-		return;
-	}
-	if (DX12HuntShouldSkipDraw(commandList)) {
-		return;
+	if (DX12ModHasAnyActiveOverrides()) {
+		if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false))
+			return;
+		if (ShouldSkipIaForMod(commandList))
+			return;
 	}
 	PFN_DRAW_INSTANCED original = DX12_CL_ORIG(commandList, 12, PFN_DRAW_INSTANCED, DrawInstanced);
 	if (original)
@@ -636,17 +650,16 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 	if (ShouldTrackBindings())
 		DX12BindingRecordDrawIndexedInstanced(commandList, indexCountPerInstance, instanceCount,
 			startIndexLocation, baseVertexLocation, startInstanceLocation);
-	DX12HuntRecordDraw(commandList);
-	if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false)) {
-		DX12LogJsonFunc("DX12DrawSkipped", "\"kind\":\"DrawIndexedInstanced\",\"reason\":\"mod_shader_skip\"");
-		return;
+	if (DX12HuntIsEnabled()) {
+		DX12HuntRecordDraw(commandList);
+		if (DX12HuntShouldSkipDraw(commandList))
+			return;
 	}
-	if (ShouldSkipIaForMod(commandList)) {
-		DX12LogJsonFunc("DX12DrawSkipped", "\"kind\":\"DrawIndexedInstanced\",\"reason\":\"mod_texture_skip\"");
-		return;
-	}
-	if (DX12HuntShouldSkipDraw(commandList)) {
-		return;
+	if (DX12ModHasAnyActiveOverrides()) {
+		if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false))
+			return;
+		if (ShouldSkipIaForMod(commandList))
+			return;
 	}
 	PFN_DRAW_INDEXED_INSTANCED original =
 		DX12_CL_ORIG(commandList, 13, PFN_DRAW_INDEXED_INSTANCED, DrawIndexedInstanced);
@@ -663,14 +676,14 @@ static void STDMETHODCALLTYPE HookedDispatch(
 		" groups=%u,%u,%u", threadGroupCountX, threadGroupCountY, threadGroupCountZ);
 	if (ShouldTrackBindings())
 		DX12BindingRecordDispatch(commandList, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
-	DX12HuntRecordDispatch(commandList);
-	if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), true)) {
-		DX12LogJsonFunc("DX12DispatchSkipped", "\"reason\":\"mod_shader_skip\"");
-		return;
+	if (DX12HuntIsEnabled()) {
+		DX12HuntRecordDispatch(commandList);
+		if (DX12HuntShouldSkipDispatch(commandList))
+			return;
 	}
-	if (DX12HuntShouldSkipDispatch(commandList)) {
+	if (DX12ModHasActiveShaderOverrides() &&
+	    DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), true))
 		return;
-	}
 	PFN_DISPATCH original = DX12_CL_ORIG(commandList, 14, PFN_DISPATCH, Dispatch);
 	if (original)
 		original(commandList, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
@@ -770,18 +783,23 @@ static void STDMETHODCALLTYPE HookedOMSetStencilRef(ID3D12GraphicsCommandList *c
 static void STDMETHODCALLTYPE HookedSetPipelineState(
 	ID3D12GraphicsCommandList *commandList, ID3D12PipelineState *pipelineState)
 {
-	ID3D12PipelineState *activePipelineState =
-		DX12ModGetReplacementPipelineState(pipelineState);
-	if (!activePipelineState)
-		activePipelineState = pipelineState;
+	ID3D12PipelineState *activePipelineState = pipelineState;
+	if (DX12ModHasActiveShaderOverrides()) {
+		ID3D12PipelineState *replacement =
+			DX12ModGetReplacementPipelineState(pipelineState);
+		if (replacement)
+			activePipelineState = replacement;
+	}
 	LogDX12Call("ID3D12GraphicsCommandList::SetPipelineState", commandList,
 		" pso=%p active=%p", pipelineState, activePipelineState);
 	if (ShouldTrackBindings()) {
 		DX12BindingSetPipelineState(commandList, activePipelineState);
 		DX12BindingRecordStateEvent(commandList, "set_pso");
 	}
-	RememberActivePipelineState(commandList, activePipelineState);
-	DX12HuntSetPipelineState(commandList, activePipelineState);
+	if (DX12ModHasActiveShaderOverrides())
+		RememberActivePipelineState(commandList, activePipelineState);
+	if (DX12HuntIsEnabled())
+		DX12HuntSetPipelineState(commandList, activePipelineState);
 	PFN_SET_PIPELINE_STATE original = DX12_CL_ORIG(commandList, 25, PFN_SET_PIPELINE_STATE, SetPipelineState);
 	if (original)
 		original(commandList, activePipelineState);
@@ -1040,7 +1058,8 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(
 		view ? static_cast<UINT>(view->Format) : 0);
 	if (ShouldTrackBindings())
 		DX12BindingSetIndexBuffer(commandList, view);
-	DX12HuntSetIndexBuffer(commandList, view);
+	if (ShouldTrackHuntIa())
+		DX12HuntSetIndexBuffer(commandList, view);
 	PFN_IA_SET_INDEX_BUFFER original = DX12_CL_ORIG(commandList, 43, PFN_IA_SET_INDEX_BUFFER, IASetIndexBuffer);
 	if (original)
 		original(commandList, view);
@@ -1050,13 +1069,12 @@ static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
 	ID3D12GraphicsCommandList *commandList, UINT startSlot, UINT count,
 	const D3D12_VERTEX_BUFFER_VIEW *views)
 {
-	char viewsText[512];
-	FormatVertexBufferViews(viewsText, sizeof(viewsText), startSlot, count, views);
 	LogDX12Call("ID3D12GraphicsCommandList::IASetVertexBuffers", commandList,
-		" start=%u count=%u views=%s", startSlot, count, viewsText);
+		" start=%u count=%u", startSlot, count);
 	if (ShouldTrackBindings())
 		DX12BindingSetVertexBuffers(commandList, startSlot, count, views);
-	DX12HuntSetVertexBuffers(commandList, startSlot, count, views);
+	if (ShouldTrackHuntIa())
+		DX12HuntSetVertexBuffers(commandList, startSlot, count, views);
 	PFN_IA_SET_VERTEX_BUFFERS original =
 		DX12_CL_ORIG(commandList, 44, PFN_IA_SET_VERTEX_BUFFERS, IASetVertexBuffers);
 	if (original)

@@ -16,6 +16,7 @@ bool DX12ModHasShaderOverride(uint64_t hash);
 bool DX12ModHasActiveShaderOverrides();
 UINT64 DX12ModGetReloadGeneration();
 bool DX12ModHasActiveTextureOverrides();
+bool DX12ModHasAnyActiveOverrides();
 bool DX12ModShouldSkipIa(uint32_t ibHash, const uint32_t *vbHashes, size_t vbHashCount);
 void DX12ModRecordGraphicsPipelineState(
 	ID3D12Device *device, ID3D12PipelineState *pipelineState,
