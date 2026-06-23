@@ -185,13 +185,13 @@ static void RecordPipelineStateUseLocked(ID3D12PipelineState *pipelineState, boo
 		AddVisitedLocked(gCS, info.hasCS ? info.cs : 0);
 }
 
-static void RecordIaUseLocked(ID3D12GraphicsCommandList *commandList)
+static void RecordIaUseLocked(ID3D12GraphicsCommandList *commandList, bool indexed)
 {
 	auto it = gCommandListIa.find(commandList);
 	if (it == gCommandListIa.end())
 		return;
 
-	if (it->second.indexBuffer.valid)
+	if (indexed && it->second.indexBuffer.valid)
 		AddVisitedLocked(gIB, IaHash(it->second.indexBuffer));
 	for (const HuntIaBuffer &buffer : it->second.vertexBuffers)
 		AddVisitedLocked(gVB, IaHash(buffer));
@@ -230,7 +230,7 @@ void DX12HuntSetPipelineState(ID3D12GraphicsCommandList *commandList, ID3D12Pipe
 	ReleaseSRWLockExclusive(&gHuntLock);
 }
 
-void DX12HuntRecordDraw(ID3D12GraphicsCommandList *commandList)
+void DX12HuntRecordDraw(ID3D12GraphicsCommandList *commandList, bool indexed)
 {
 	if (!gHuntingEnabled || !commandList)
 		return;
@@ -238,7 +238,7 @@ void DX12HuntRecordDraw(ID3D12GraphicsCommandList *commandList)
 	AcquireSRWLockExclusive(&gHuntLock);
 	gDrawCalls++;
 	RecordPipelineStateUseLocked(GetCurrentPipelineStateLocked(commandList), true, false);
-	RecordIaUseLocked(commandList);
+	RecordIaUseLocked(commandList, indexed);
 	ReleaseSRWLockExclusive(&gHuntLock);
 }
 
@@ -359,7 +359,7 @@ static bool HuntShouldSkipLocked(ID3D12GraphicsCommandList *commandList, bool di
 		(gPS.armed && ps && info.hasPS && info.ps == ps);
 }
 
-static bool IaShouldSkipLocked(ID3D12GraphicsCommandList *commandList)
+static bool IaShouldSkipLocked(ID3D12GraphicsCommandList *commandList, bool indexed)
 {
 	if (!gHuntingEnabled)
 		return false;
@@ -373,7 +373,7 @@ static bool IaShouldSkipLocked(ID3D12GraphicsCommandList *commandList)
 	if (state == gCommandListIa.end())
 		return false;
 
-	if (gIB.armed && ib && state->second.indexBuffer.valid &&
+	if (indexed && gIB.armed && ib && state->second.indexBuffer.valid &&
 	    IaHash(state->second.indexBuffer) == ib)
 		return true;
 	if (gVB.armed && vb) {
@@ -386,12 +386,12 @@ static bool IaShouldSkipLocked(ID3D12GraphicsCommandList *commandList)
 	return false;
 }
 
-bool DX12HuntShouldSkipDraw(ID3D12GraphicsCommandList *commandList)
+bool DX12HuntShouldSkipDraw(ID3D12GraphicsCommandList *commandList, bool indexed)
 {
 	if (!commandList)
 		return false;
 	AcquireSRWLockShared(&gHuntLock);
-	bool skip = HuntShouldSkipLocked(commandList, false) || IaShouldSkipLocked(commandList);
+	bool skip = HuntShouldSkipLocked(commandList, false) || IaShouldSkipLocked(commandList, indexed);
 	ReleaseSRWLockShared(&gHuntLock);
 	return skip;
 }
@@ -451,6 +451,46 @@ bool DX12HuntGetIaHashes(
 		*vbHashWritten = written;
 	ReleaseSRWLockShared(&gHuntLock);
 	return (ibHash && *ibHash) || written > 0;
+}
+
+bool DX12HuntGetIaHashState(ID3D12GraphicsCommandList *commandList, DX12IaHashState *outState)
+{
+	if (!outState)
+		return false;
+	*outState = DX12IaHashState();
+	if (!commandList)
+		return false;
+
+	AcquireSRWLockShared(&gHuntLock);
+	auto state = gCommandListIa.find(commandList);
+	if (state == gCommandListIa.end()) {
+		ReleaseSRWLockShared(&gHuntLock);
+		return false;
+	}
+
+	const HuntIaBuffer &ib = state->second.indexBuffer;
+	outState->indexHash = IaHash(ib);
+	if (outState->indexHash) {
+		outState->hasIndexBuffer = true;
+		outState->indexView.BufferLocation = ib.gpuVa;
+		outState->indexView.SizeInBytes = ib.size;
+		outState->indexView.Format = static_cast<DXGI_FORMAT>(ib.format);
+	}
+
+	for (const HuntIaBuffer &buffer : state->second.vertexBuffers) {
+		uint32_t hash = IaHash(buffer);
+		if (!hash)
+			continue;
+		DX12IaBufferHash item;
+		item.slot = buffer.slot;
+		item.hash = hash;
+		item.vertexView.BufferLocation = buffer.gpuVa;
+		item.vertexView.SizeInBytes = buffer.size;
+		item.vertexView.StrideInBytes = buffer.stride;
+		outState->vertexBuffers.push_back(item);
+	}
+	ReleaseSRWLockShared(&gHuntLock);
+	return outState->hasIndexBuffer || !outState->vertexBuffers.empty();
 }
 
 bool DX12HuntIsEnabled()

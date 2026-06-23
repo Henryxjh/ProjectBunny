@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "IniDocument.h"
+#include "MigotoCommandList.h"
 
 namespace Bunny {
 
@@ -14,6 +15,7 @@ struct ShaderOverrideConfig
 	std::wstring section;
 	uint64_t hash = 0;
 	bool handlingSkip = false;
+	CommandListLinks commandLists;
 };
 
 using ShaderOverrideMap = std::unordered_map<uint64_t, ShaderOverrideConfig>;

@@ -70,6 +70,8 @@ void ParseShaderOverrideSections(
 					config.handlingSkip = true;
 				continue;
 			}
+
+			ParseCommandListLinksFromEntry(key, entry.value, &config.commandLists);
 		}
 
 		if (hasHash)

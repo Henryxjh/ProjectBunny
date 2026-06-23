@@ -6,6 +6,8 @@
 
 #include <vector>
 
+#include "DX12ShaderHunt.h"
+
 void DX12ModRuntimeLoad(const wchar_t *configPath);
 void DX12ModRuntimeReload();
 uint64_t DX12ModHashShaderBytecode(const void *data, size_t size);
@@ -17,7 +19,25 @@ bool DX12ModHasActiveShaderOverrides();
 UINT64 DX12ModGetReloadGeneration();
 bool DX12ModHasActiveTextureOverrides();
 bool DX12ModHasAnyActiveOverrides();
-bool DX12ModShouldSkipIa(uint32_t ibHash, const uint32_t *vbHashes, size_t vbHashCount);
+bool DX12ModShouldSkipIa(
+	uint32_t ibHash, const uint32_t *vbHashes, size_t vbHashCount,
+	uint32_t vertexCount, uint32_t indexCount, uint32_t instanceCount);
+struct DX12ModIaReplacement
+{
+	bool skip = false;
+	bool hasIndexBuffer = false;
+	D3D12_INDEX_BUFFER_VIEW indexBuffer = {};
+	UINT vertexBufferStartSlot = 0;
+	std::vector<D3D12_VERTEX_BUFFER_VIEW> vertexBuffers;
+};
+bool DX12ModPrepareIaReplacement(
+	ID3D12GraphicsCommandList *commandList, const DX12IaHashState &iaState,
+	uint32_t vertexCount, uint32_t indexCount, uint32_t instanceCount,
+	DX12ModIaReplacement *replacement);
+void DX12ModRunPostIaReplacement(
+	ID3D12GraphicsCommandList *commandList, const DX12IaHashState &iaState,
+	uint32_t vertexCount, uint32_t indexCount, uint32_t instanceCount,
+	DX12ModIaReplacement *replacement);
 void DX12ModRecordGraphicsPipelineState(
 	ID3D12Device *device, ID3D12PipelineState *pipelineState,
 	const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc);

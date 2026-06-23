@@ -200,6 +200,16 @@ static PFN_EXECUTE_INDIRECT gOrigExecuteIndirect = nullptr;
 static SRWLOCK gCommandListStateLock = SRWLOCK_INIT;
 static std::unordered_map<ID3D12GraphicsCommandList*, ID3D12PipelineState*> gActivePipelineStates;
 
+struct ActiveIaState
+{
+	bool hasIndexBuffer = false;
+	D3D12_INDEX_BUFFER_VIEW indexBuffer = {};
+	bool hasVertexBuffer[32] = {};
+	D3D12_VERTEX_BUFFER_VIEW vertexBuffers[32] = {};
+};
+
+static std::unordered_map<ID3D12GraphicsCommandList*, ActiveIaState> gActiveIaStates;
+
 static void LogDX12Call(const char *name, const void *object, const char *fmt = nullptr, ...)
 {
 	(void)name;
@@ -232,6 +242,55 @@ static void RememberActivePipelineState(
 	ReleaseSRWLockExclusive(&gCommandListStateLock);
 }
 
+static void ResetActiveIaState(ID3D12GraphicsCommandList *commandList)
+{
+	if (!commandList)
+		return;
+	AcquireSRWLockExclusive(&gCommandListStateLock);
+	gActiveIaStates[commandList] = ActiveIaState();
+	ReleaseSRWLockExclusive(&gCommandListStateLock);
+}
+
+static void RememberActiveIndexBuffer(
+	ID3D12GraphicsCommandList *commandList, const D3D12_INDEX_BUFFER_VIEW *view)
+{
+	if (!commandList)
+		return;
+	AcquireSRWLockExclusive(&gCommandListStateLock);
+	ActiveIaState &state = gActiveIaStates[commandList];
+	state.hasIndexBuffer = view != nullptr;
+	state.indexBuffer = view ? *view : D3D12_INDEX_BUFFER_VIEW();
+	ReleaseSRWLockExclusive(&gCommandListStateLock);
+}
+
+static void RememberActiveVertexBuffers(
+	ID3D12GraphicsCommandList *commandList, UINT startSlot, UINT count,
+	const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+	if (!commandList)
+		return;
+	AcquireSRWLockExclusive(&gCommandListStateLock);
+	ActiveIaState &state = gActiveIaStates[commandList];
+	for (UINT i = 0; i < count && startSlot + i < ARRAYSIZE(state.vertexBuffers); ++i) {
+		state.hasVertexBuffer[startSlot + i] = views != nullptr;
+		state.vertexBuffers[startSlot + i] = views ? views[i] : D3D12_VERTEX_BUFFER_VIEW();
+	}
+	ReleaseSRWLockExclusive(&gCommandListStateLock);
+}
+
+static ActiveIaState GetActiveIaState(ID3D12GraphicsCommandList *commandList)
+{
+	ActiveIaState state;
+	if (!commandList)
+		return state;
+	AcquireSRWLockShared(&gCommandListStateLock);
+	auto it = gActiveIaStates.find(commandList);
+	if (it != gActiveIaStates.end())
+		state = it->second;
+	ReleaseSRWLockShared(&gCommandListStateLock);
+	return state;
+}
+
 static ID3D12PipelineState *GetActivePipelineState(ID3D12GraphicsCommandList *commandList)
 {
 	if (!commandList)
@@ -244,17 +303,18 @@ static ID3D12PipelineState *GetActivePipelineState(ID3D12GraphicsCommandList *co
 	return pipelineState;
 }
 
-static bool ShouldSkipIaForMod(ID3D12GraphicsCommandList *commandList)
+static bool PrepareIaForMod(
+	ID3D12GraphicsCommandList *commandList, DX12IaHashState *iaState,
+	uint32_t vertexCount, uint32_t indexCount, uint32_t instanceCount,
+	DX12ModIaReplacement *replacement)
 {
 	if (!DX12ModHasActiveTextureOverrides())
 		return false;
 
-	uint32_t ibHash = 0;
-	uint32_t vbHashes[32] = {};
-	size_t vbHashCount = 0;
-	if (!DX12HuntGetIaHashes(commandList, &ibHash, vbHashes, ARRAYSIZE(vbHashes), &vbHashCount))
+	if (!iaState || !DX12HuntGetIaHashState(commandList, iaState))
 		return false;
-	return DX12ModShouldSkipIa(ibHash, vbHashes, vbHashCount);
+	return DX12ModPrepareIaReplacement(
+		commandList, *iaState, vertexCount, indexCount, instanceCount, replacement);
 }
 
 static void FormatVertexBufferViews(
@@ -384,6 +444,52 @@ static T GetCommandListOriginal(
 
 #define DX12_QUEUE_ORIG(queue, slot, type, name) \
 	GetCommandQueueOriginal<type>(queue, slot, gOrigQueue##name, "ID3D12CommandQueue::" #name)
+
+static void ApplyIaReplacement(
+	ID3D12GraphicsCommandList *commandList, const DX12ModIaReplacement &replacement)
+{
+	if (replacement.hasIndexBuffer) {
+		PFN_IA_SET_INDEX_BUFFER original =
+			DX12_CL_ORIG(commandList, 43, PFN_IA_SET_INDEX_BUFFER, IASetIndexBuffer);
+		if (original)
+			original(commandList, &replacement.indexBuffer);
+	}
+
+	if (!replacement.vertexBuffers.empty()) {
+		PFN_IA_SET_VERTEX_BUFFERS original =
+			DX12_CL_ORIG(commandList, 44, PFN_IA_SET_VERTEX_BUFFERS, IASetVertexBuffers);
+		if (original)
+			original(commandList, replacement.vertexBufferStartSlot,
+				static_cast<UINT>(replacement.vertexBuffers.size()),
+				replacement.vertexBuffers.data());
+	}
+}
+
+static void RestoreIaReplacement(
+	ID3D12GraphicsCommandList *commandList, const DX12ModIaReplacement &replacement,
+	const ActiveIaState &originalState)
+{
+	if (replacement.hasIndexBuffer) {
+		PFN_IA_SET_INDEX_BUFFER original =
+			DX12_CL_ORIG(commandList, 43, PFN_IA_SET_INDEX_BUFFER, IASetIndexBuffer);
+		if (original)
+			original(commandList,
+				originalState.hasIndexBuffer ? &originalState.indexBuffer : nullptr);
+	}
+
+	if (!replacement.vertexBuffers.empty()) {
+		D3D12_VERTEX_BUFFER_VIEW restore[32] = {};
+		const UINT start = replacement.vertexBufferStartSlot;
+		const UINT count = static_cast<UINT>(replacement.vertexBuffers.size());
+		for (UINT i = 0; i < count && start + i < ARRAYSIZE(originalState.vertexBuffers); ++i)
+			restore[i] = originalState.hasVertexBuffer[start + i] ?
+				originalState.vertexBuffers[start + i] : D3D12_VERTEX_BUFFER_VIEW();
+		PFN_IA_SET_VERTEX_BUFFERS original =
+			DX12_CL_ORIG(commandList, 44, PFN_IA_SET_VERTEX_BUFFERS, IASetVertexBuffers);
+		if (original)
+			original(commandList, start, count, restore);
+	}
+}
 
 static void RegisterCommandList(IUnknown *commandList, ID3D12PipelineState *initialState)
 {
@@ -595,6 +701,8 @@ static HRESULT STDMETHODCALLTYPE HookedResetCommandList(
 		DX12BindingResetCommandList(commandList, initialState);
 	if (ShouldTrackPsoState())
 		RememberActivePipelineState(commandList, initialState);
+	if (DX12ModHasActiveTextureOverrides())
+		ResetActiveIaState(commandList);
 	if (ShouldTrackPsoState() || ShouldTrackHuntIa())
 		DX12HuntResetCommandList(commandList, initialState);
 	PFN_RESET_COMMAND_LIST original = DX12_CL_ORIG(commandList, 10, PFN_RESET_COMMAND_LIST, ResetCommandList);
@@ -623,15 +731,30 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
 		DX12BindingRecordDrawInstanced(commandList, vertexCountPerInstance, instanceCount,
 			startVertexLocation, startInstanceLocation);
 	if (DX12HuntIsEnabled()) {
-		DX12HuntRecordDraw(commandList);
-		if (DX12HuntShouldSkipDraw(commandList))
+		if (DX12HuntShouldSkipDraw(commandList, false))
 			return;
+		DX12HuntRecordDraw(commandList, false);
 	}
 	if (DX12ModHasAnyActiveOverrides()) {
 		if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false))
 			return;
-		if (ShouldSkipIaForMod(commandList))
+		DX12ModIaReplacement iaReplacement;
+		DX12IaHashState iaState;
+		if (PrepareIaForMod(
+			commandList, &iaState, vertexCountPerInstance, 0, instanceCount, &iaReplacement)) {
+			if (iaReplacement.skip)
+				return;
+			ActiveIaState originalIa = GetActiveIaState(commandList);
+			ApplyIaReplacement(commandList, iaReplacement);
+			PFN_DRAW_INSTANCED original = DX12_CL_ORIG(commandList, 12, PFN_DRAW_INSTANCED, DrawInstanced);
+			if (original)
+				original(commandList, vertexCountPerInstance, instanceCount,
+					startVertexLocation, startInstanceLocation);
+			RestoreIaReplacement(commandList, iaReplacement, originalIa);
+			DX12ModRunPostIaReplacement(
+				commandList, iaState, vertexCountPerInstance, 0, instanceCount, &iaReplacement);
 			return;
+		}
 	}
 	PFN_DRAW_INSTANCED original = DX12_CL_ORIG(commandList, 12, PFN_DRAW_INSTANCED, DrawInstanced);
 	if (original)
@@ -651,15 +774,31 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 		DX12BindingRecordDrawIndexedInstanced(commandList, indexCountPerInstance, instanceCount,
 			startIndexLocation, baseVertexLocation, startInstanceLocation);
 	if (DX12HuntIsEnabled()) {
-		DX12HuntRecordDraw(commandList);
-		if (DX12HuntShouldSkipDraw(commandList))
+		if (DX12HuntShouldSkipDraw(commandList, true))
 			return;
+		DX12HuntRecordDraw(commandList, true);
 	}
 	if (DX12ModHasAnyActiveOverrides()) {
 		if (DX12ModShouldSkipPipelineState(GetActivePipelineState(commandList), false))
 			return;
-		if (ShouldSkipIaForMod(commandList))
+		DX12ModIaReplacement iaReplacement;
+		DX12IaHashState iaState;
+		if (PrepareIaForMod(
+			commandList, &iaState, 0, indexCountPerInstance, instanceCount, &iaReplacement)) {
+			if (iaReplacement.skip)
+				return;
+			ActiveIaState originalIa = GetActiveIaState(commandList);
+			ApplyIaReplacement(commandList, iaReplacement);
+			PFN_DRAW_INDEXED_INSTANCED original =
+				DX12_CL_ORIG(commandList, 13, PFN_DRAW_INDEXED_INSTANCED, DrawIndexedInstanced);
+			if (original)
+				original(commandList, indexCountPerInstance, instanceCount,
+					startIndexLocation, baseVertexLocation, startInstanceLocation);
+			RestoreIaReplacement(commandList, iaReplacement, originalIa);
+			DX12ModRunPostIaReplacement(
+				commandList, iaState, 0, indexCountPerInstance, instanceCount, &iaReplacement);
 			return;
+		}
 	}
 	PFN_DRAW_INDEXED_INSTANCED original =
 		DX12_CL_ORIG(commandList, 13, PFN_DRAW_INDEXED_INSTANCED, DrawIndexedInstanced);
@@ -1060,6 +1199,8 @@ static void STDMETHODCALLTYPE HookedIASetIndexBuffer(
 		DX12BindingSetIndexBuffer(commandList, view);
 	if (ShouldTrackHuntIa())
 		DX12HuntSetIndexBuffer(commandList, view);
+	if (DX12ModHasActiveTextureOverrides())
+		RememberActiveIndexBuffer(commandList, view);
 	PFN_IA_SET_INDEX_BUFFER original = DX12_CL_ORIG(commandList, 43, PFN_IA_SET_INDEX_BUFFER, IASetIndexBuffer);
 	if (original)
 		original(commandList, view);
@@ -1075,6 +1216,8 @@ static void STDMETHODCALLTYPE HookedIASetVertexBuffers(
 		DX12BindingSetVertexBuffers(commandList, startSlot, count, views);
 	if (ShouldTrackHuntIa())
 		DX12HuntSetVertexBuffers(commandList, startSlot, count, views);
+	if (DX12ModHasActiveTextureOverrides())
+		RememberActiveVertexBuffers(commandList, startSlot, count, views);
 	PFN_IA_SET_VERTEX_BUFFERS original =
 		DX12_CL_ORIG(commandList, 44, PFN_IA_SET_VERTEX_BUFFERS, IASetVertexBuffers);
 	if (original)

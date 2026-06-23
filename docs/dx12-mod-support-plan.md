@@ -152,6 +152,43 @@ Completed:
   - buffer GPU VA to resource-summary resolution is cached and invalidated when tracked resources change;
   - PSO shader skip decisions are cached per reload generation;
   - TextureOverride IA hash match results are cached for repeated IB/VB binding combinations.
+- Began extracting reusable DX11/DX12 INI semantics into BunnyCore:
+  - `MigotoTextureOverride` now keeps multiple `[TextureOverride*]` entries per hash, matching the DX11 duplicate-hash/draw-context shape.
+  - `MigotoTextureOverride` parses `ib = ResourceName`, `vbN = ResourceName`, `match_vertex_count`, `match_index_count`, and `match_instance_count`.
+  - Added `MigotoResource` as the shared parser/model for `[Resource*]` sections.
+  - DX12 reload now parses `[Resource*]` sections and logs the loaded resource count.
+  - DX12 TextureOverride IA `handling = skip` now honors the simple draw-count match fields above.
+- Added first DX12 IA buffer replacement MVP:
+  - `[Resource*] filename = ...` and hex `data = ...` can be loaded as upload-heap D3D12 buffers.
+  - `[TextureOverride*] ib = ResourceName` and `vbN = ResourceName` bind replacement IA views for the matching draw.
+  - Replacement IA views are applied immediately before the draw and restored afterwards, avoiding permanent command-list IA state mutation.
+  - Loaded resources are released and recreated on F10 reload.
+  - Current MVP treats replacement resources as buffers only and uses upload heaps to avoid copy queue/state-transition complexity.
+- Tightened DX12 IA replacement matching and view metadata:
+  - `DX12HuntGetIaHashState` now exposes IB hash/view and VB slot/hash/view state.
+  - TextureOverride VB replacement matching is now slot-aware for `vbN` entries.
+  - Replacement IB views inherit the current bound IB format when available, falling back to `DXGI_FORMAT_R32_UINT`.
+  - Replacement VB views inherit the current bound slot stride unless `[Resource*] stride` overrides it.
+- Added the first shared CommandList subset for DX12 mods:
+  - New BunnyCore `MigotoCommandList` parser models `[CommandList*]` sections instead of reusing the large DX11 executor directly.
+  - `[TextureOverride*]` and `[ShaderOverride*]` now parse `run`, `pre`, and `post` links into shared Core data.
+  - DX12 reload parses `[CommandList*]` sections and logs `commandLists`.
+  - DX12 IA matching can now execute TextureOverride-linked `pre` and `run` command lists before the draw.
+  - Supported command-list actions in the DX12 MVP:
+    - `run = CommandListName`
+    - `checktextureoverride = ib`
+    - `checktextureoverride = vbN`
+    - `handling = skip`
+    - `ib = ResourceName`
+    - `vbN = ResourceName`
+  - Command-list resource actions reuse the same upload-heap buffer resource path as direct `[TextureOverride*] ib/vbN`.
+  - Command-list recursion is capped to avoid accidental infinite loops.
+  - `post` links are parsed and invoked after the draw hook, but the current supported action set is still IA-buffer-oriented; full DX11 post-state semantics are not implemented yet.
+- Fixed a DX12 IB hunting divergence from DX11 behavior:
+  - IB hunting is now indexed-draw aware; non-indexed `DrawInstanced` no longer records or hides the command-list's stale/current IB.
+  - Hunting skip is evaluated before appending newly seen hashes for the current draw. This prevents the selected set index from shifting during the same draw and making the visible selection fail to hide.
+  - This should reduce redundant IB entries and make selected IB hashes hide matching indexed draws again.
+  - DX12 IA hunting still uses metadata/resource-level hashes rather than DX11-style live content CRC, so exact counts may still differ until asynchronous content hashing is implemented.
 
 Build artifact copied by the project script:
 
@@ -163,7 +200,9 @@ Still open:
 - Runtime reload is manual F10 only; no file watcher yet.
 - Explicit replacement path keys.
 - ShaderRegex and HLSL text compile.
-- Buffer and descriptor replacement.
+- Descriptor/SRV/UAV/CBV replacement.
+- `[Resource*]` execution gaps: only buffer upload resources are supported; texture resources and descriptor-backed resources are not created yet.
+- Full DX11 CommandList semantics: variables, conditions, arithmetic expressions, resource copy, draw/dispatch commands, clear/copy commands, namespace resolution, and real post-state side effects are not implemented yet.
 - Release tracking for cached original/replacement PSOs.
 - True content CRC display for live IB/VB hunting. Current live IA hunting uses stable hash semantics, but the live hash is still metadata/view-based to avoid GPU stalls; content hashes are still available through F8 dump/readback output.
 - Lightweight on-demand IA tracker for live IB/VB hunting without enabling the full F8 binding tracker.
@@ -277,7 +316,8 @@ Current DX12 support:
 
 - This loader only feeds the current DX12 parser. Today that means `[ShaderOverride*] hash` and `handling = skip`.
 - `[TextureOverride*] hash` with `handling = skip` is parsed and applied to live IA IB/VB hashes.
-- Complex DX11 namespacing, conditional include logic, command lists, resources, and full texture/buffer replacement still need separate parser/runtime work.
+- `[TextureOverride*]` resource references and `[Resource*]` sections are parsed into BunnyCore models; DX12 can execute the first IA buffer replacement MVP for `ib` and `vbN`.
+- Complex DX11 namespacing, conditional include logic, command lists, resource creation, and full texture/buffer replacement still need separate runtime work.
 - Included mods that rely only on shader override hash replacement should be visible now.
 - Included mods that hide an IA buffer by `TextureOverride hash + handling = skip` should be visible after F10 reload.
 
@@ -289,12 +329,18 @@ Add `[Resource*]` binary buffer loading and `[TextureOverride*]` matching for IA
   - `[TextureOverride*] hash = <8hex>`
   - `handling = skip`
   - matches current DX12 IA IB/VB hunting hash.
+  - simple equality draw filters: `match_vertex_count`, `match_index_count`, `match_instance_count`.
   - F10 reload refreshes the map.
-- `vb0 = ResourceName`
-- `vb1 = ResourceName`
-- `ib = ResourceName`
-- Static `.buf/.vb/.ib` file backed resources.
-- Draw-context matching such as `match_index_count` and `match_vertex_count`.
+  - `vb0 = ResourceName`
+  - `vb1 = ResourceName`
+  - `ib = ResourceName`
+  - `[Resource*] filename = ...` for static buffer bytes.
+  - `[Resource*] data = ...` for inline hex buffer bytes.
+  - Upload-heap D3D12 buffers are created lazily on first matching draw.
+- Still to implement:
+  - Draw-context matching beyond simple equality counts.
+  - Explicit IB format and VB stride config keys for cases where the current bound view cannot be used as a template.
+  - Default-heap upload path with async copy for better performance.
 
 ## Stage 4: Descriptor Replacement
 
@@ -308,11 +354,21 @@ Replace SRV/UAV/CBV resources by patching descriptor tables or descriptor heaps:
 
 Implement only the DX11 command-list features needed by generated ZZMI-style mods first:
 
-- `run = CommandListX`
-- `pre` and `post`
-- `checktextureoverride = ib/vb0`
-- simple resource copy
-- variables/key toggles after the core path is stable
+- Implemented first slice:
+  - `run = CommandListX`
+  - TextureOverride `pre`, `run`, and `post` links are parsed.
+  - `[CommandList*] checktextureoverride = ib/vbN`
+  - `[CommandList*] handling = skip`
+  - `[CommandList*] ib = ResourceName`
+  - `[CommandList*] vbN = ResourceName`
+  - command-list-driven IA replacements run before the matching draw and restore original IA bindings after the draw.
+- Still to implement:
+  - descriptor/SRV/UAV/CBV command-list targets;
+  - texture resource creation and texture view binding;
+  - simple resource copy;
+  - variables/key toggles;
+  - conditions and expression evaluation;
+  - full DX11 `post` behavior beyond the current parsed/invoked placeholder path.
 
 ## Test Loop
 
