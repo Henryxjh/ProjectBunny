@@ -55,5 +55,18 @@ target_compile_definitions(DirectX12 PRIVATE
     MIGOTO_DX=12
 )
 
+file(GLOB _D3D12_HEADERS "/opt/msvc/kits/10/Include/*/um/d3d12.h")
+if(_D3D12_HEADERS)
+    list(SORT _D3D12_HEADERS)
+    list(GET _D3D12_HEADERS -1 _D3D12_HEADER)
+    file(READ "${_D3D12_HEADER}" _D3D12_HEADER_CONTENT)
+    if(_D3D12_HEADER_CONTENT MATCHES "D3D12_DEPTH_STENCIL_DESC2" AND
+       _D3D12_HEADER_CONTENT MATCHES "D3D12_RASTERIZER_DESC1" AND
+       _D3D12_HEADER_CONTENT MATCHES "D3D12_RASTERIZER_DESC2")
+        target_compile_definitions(DirectX12 PRIVATE
+            PROJECT_HAS_D3D12_PIPELINE_STREAM_DESC2=1)
+    endif()
+endif()
+
 set_target_msvc_options(DirectX12)
 set_target_common_definitions(DirectX12)

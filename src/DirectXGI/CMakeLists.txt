@@ -41,6 +41,7 @@ target_link_options(dxgi PRIVATE
 
 set_target_properties(dxgi PROPERTIES
     OUTPUT_NAME "dxgi"
+    ARCHIVE_OUTPUT_NAME "dxgi_proxy"
 )
 
 set_target_msvc_options(dxgi)

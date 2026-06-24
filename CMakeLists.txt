@@ -2,6 +2,50 @@
 # 3DMigotoDX12 — CMake 构建系统
 # ============================================================
 cmake_minimum_required(VERSION 3.20)
+
+# The Wine/MSVC wrapper sends /showIncludes output to stderr. CMake's Makefile
+# dependency wrapper only filters stdout, so GNU make later sees lines like
+# "Note: including file:" as malformed dependency targets.
+if(CMAKE_GENERATOR MATCHES "Makefiles" AND
+   CMAKE_TOOLCHAIN_FILE MATCHES "/opt/msvc/cmake/toolchain")
+    set(CMAKE_DEPENDS_USE_COMPILER FALSE CACHE BOOL
+        "Disable compiler dependency scanning for Wine/MSVC Makefiles" FORCE)
+endif()
+
+if(CMAKE_TOOLCHAIN_FILE MATCHES "/opt/msvc/cmake/toolchain")
+    file(GLOB _PROJECT_MSVC_CRT_LIBS "/opt/msvc/VC/Tools/MSVC/*/lib/x64/LIBCMT.lib")
+    file(GLOB _PROJECT_MSVC_UCRT_LIBS "/opt/msvc/kits/10/Lib/*/ucrt/x64/libucrt.lib")
+    file(GLOB _PROJECT_MSVC_UM_LIBS "/opt/msvc/kits/10/Lib/*/um/x64/kernel32.lib")
+    foreach(_PROJECT_MSVC_LIBS
+            _PROJECT_MSVC_CRT_LIBS
+            _PROJECT_MSVC_UCRT_LIBS
+            _PROJECT_MSVC_UM_LIBS)
+        if(${_PROJECT_MSVC_LIBS})
+            list(SORT ${_PROJECT_MSVC_LIBS})
+            list(GET ${_PROJECT_MSVC_LIBS} -1 _PROJECT_MSVC_LIB)
+            get_filename_component(_PROJECT_MSVC_LIB_DIR "${_PROJECT_MSVC_LIB}" DIRECTORY)
+            list(APPEND _PROJECT_MSVC_LINK_DIRS "${_PROJECT_MSVC_LIB_DIR}")
+        endif()
+    endforeach()
+    if(_PROJECT_MSVC_LINK_DIRS)
+        foreach(_PROJECT_MSVC_LINK_DIR IN LISTS _PROJECT_MSVC_LINK_DIRS)
+            set(_PROJECT_MSVC_LINK_FLAG " /LIBPATH:${_PROJECT_MSVC_LINK_DIR}")
+            foreach(_PROJECT_MSVC_LINKER_FLAGS
+                    CMAKE_EXE_LINKER_FLAGS
+                    CMAKE_SHARED_LINKER_FLAGS
+                    CMAKE_MODULE_LINKER_FLAGS)
+                string(FIND "${${_PROJECT_MSVC_LINKER_FLAGS}}"
+                    "${_PROJECT_MSVC_LINK_FLAG}" _PROJECT_MSVC_LINK_FLAG_INDEX)
+                if(_PROJECT_MSVC_LINK_FLAG_INDEX EQUAL -1)
+                    set(${_PROJECT_MSVC_LINKER_FLAGS}
+                        "${${_PROJECT_MSVC_LINKER_FLAGS}}${_PROJECT_MSVC_LINK_FLAG}"
+                        CACHE STRING "${_PROJECT_MSVC_LINKER_FLAGS}" FORCE)
+                endif()
+            endforeach()
+        endforeach()
+    endif()
+endif()
+
 project(3DMigotoDX12
     VERSION 1.3.16
     DESCRIPTION "3Dmigoto - DirectX API Hooking and Shader Manipulation Tool"
