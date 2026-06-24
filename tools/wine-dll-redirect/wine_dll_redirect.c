@@ -19,6 +19,7 @@
 
 typedef int (*open_fn)(const char *path, int flags, ...);
 typedef int (*openat_fn)(int dirfd, const char *path, int flags, ...);
+typedef FILE *(*fopen_fn)(const char *path, const char *mode);
 typedef int (*access_fn)(const char *path, int mode);
 typedef int (*faccessat_fn)(int dirfd, const char *path, int mode, int flags);
 typedef int (*stat_fn)(const char *path, struct stat *buf);
@@ -37,6 +38,9 @@ struct redirect_rule {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_initialized;
 static bool g_debug;
+static bool g_trace_open;
+static bool g_trace_all_open;
+static bool g_one_shot = true;
 static FILE *g_log;
 static struct redirect_rule g_rules[16];
 static size_t g_rule_count;
@@ -45,6 +49,8 @@ static open_fn real_open_fn;
 static open_fn real_open64_fn;
 static openat_fn real_openat_fn;
 static openat_fn real_openat64_fn;
+static fopen_fn real_fopen_fn;
+static fopen_fn real_fopen64_fn;
 static access_fn real_access_fn;
 static faccessat_fn real_faccessat_fn;
 static stat_fn real_stat_fn;
@@ -74,6 +80,41 @@ static void debug_log(const char *fmt, ...)
     va_end(ap);
 }
 
+static void resolve_real_functions(void)
+{
+    real_open_fn = (open_fn)dlsym(RTLD_NEXT, "open");
+    real_open64_fn = (open_fn)dlsym(RTLD_NEXT, "open64");
+    real_openat_fn = (openat_fn)dlsym(RTLD_NEXT, "openat");
+    real_openat64_fn = (openat_fn)dlsym(RTLD_NEXT, "openat64");
+    real_fopen_fn = (fopen_fn)dlsym(RTLD_NEXT, "fopen");
+    real_fopen64_fn = (fopen_fn)dlsym(RTLD_NEXT, "fopen64");
+    real_access_fn = (access_fn)dlsym(RTLD_NEXT, "access");
+    real_faccessat_fn = (faccessat_fn)dlsym(RTLD_NEXT, "faccessat");
+    real_stat_fn = (stat_fn)dlsym(RTLD_NEXT, "stat");
+    real_stat64_fn = (stat64_fn)dlsym(RTLD_NEXT, "stat64");
+    real_lstat_fn = (stat_fn)dlsym(RTLD_NEXT, "lstat");
+    real_lstat64_fn = (stat64_fn)dlsym(RTLD_NEXT, "lstat64");
+    real_fstatat_fn = (fstatat_fn)dlsym(RTLD_NEXT, "fstatat");
+    real_newfstatat_fn = (fstatat_fn)dlsym(RTLD_NEXT, "newfstatat");
+    real_xstat_fn = (xstat_fn)dlsym(RTLD_NEXT, "__xstat");
+    real_xstat64_fn = (xstat64_fn)dlsym(RTLD_NEXT, "__xstat64");
+    real_lxstat_fn = (xstat_fn)dlsym(RTLD_NEXT, "__lxstat");
+    real_lxstat64_fn = (xstat64_fn)dlsym(RTLD_NEXT, "__lxstat64");
+    real_syscall_fn = (syscall_fn)dlsym(RTLD_NEXT, "syscall");
+}
+
+static bool env_enabled(const char *name)
+{
+    const char *value = getenv(name);
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static bool env_disabled(const char *name)
+{
+    const char *value = getenv(name);
+    return value && (!strcmp(value, "0") || !strcasecmp(value, "false") || !strcasecmp(value, "no"));
+}
+
 static bool has_dll_suffix(const char *path, const char *dll)
 {
     size_t path_len = strlen(path);
@@ -92,6 +133,28 @@ static bool has_dll_suffix(const char *path, const char *dll)
     return tail[-1] == '/' || tail[-1] == '\\';
 }
 
+static bool looks_relevant_path(const char *path)
+{
+    if (!path)
+        return false;
+    if (g_trace_all_open)
+        return true;
+    if (strcasestr(path, ".dll"))
+        return true;
+
+    for (size_t i = 0; i < g_rule_count; ++i) {
+        if (strcasestr(path, g_rules[i].dll))
+            return true;
+    }
+    return false;
+}
+
+static void trace_open_path(const char *api, const char *path)
+{
+    if (g_trace_open && looks_relevant_path(path))
+        debug_log("trace %s %s", api, path ? path : "(null)");
+}
+
 static bool is_absolute_path(const char *path)
 {
     return path && (path[0] == '/' || path[0] == '\\');
@@ -102,7 +165,10 @@ static void add_rule(const char *dll, const char *target)
     if (!dll || !*dll || !target || !*target || g_rule_count >= sizeof(g_rules) / sizeof(g_rules[0]))
         return;
 
-    snprintf(g_rules[g_rule_count].dll, sizeof(g_rules[g_rule_count].dll), "%s", dll);
+    if (strchr(dll, '.'))
+        snprintf(g_rules[g_rule_count].dll, sizeof(g_rules[g_rule_count].dll), "%s", dll);
+    else
+        snprintf(g_rules[g_rule_count].dll, sizeof(g_rules[g_rule_count].dll), "%s.dll", dll);
     snprintf(g_rules[g_rule_count].target, sizeof(g_rules[g_rule_count].target), "%s", target);
     g_rules[g_rule_count].used = false;
     debug_log("rule %s -> %s", g_rules[g_rule_count].dll, g_rules[g_rule_count].target);
@@ -141,27 +207,24 @@ static void init_once(void)
         return;
     }
 
-    g_debug = getenv("WINE_DLL_REDIRECT_DEBUG") && strcmp(getenv("WINE_DLL_REDIRECT_DEBUG"), "0") != 0;
+    resolve_real_functions();
+
+    g_debug = env_enabled("WINE_DLL_REDIRECT_DEBUG");
+    g_trace_open = env_enabled("WINE_DLL_REDIRECT_TRACE_OPEN");
+    g_trace_all_open = getenv("WINE_DLL_REDIRECT_TRACE_OPEN") &&
+                       !strcasecmp(getenv("WINE_DLL_REDIRECT_TRACE_OPEN"), "all");
+    g_one_shot = !env_disabled("WINE_DLL_REDIRECT_ONESHOT");
+
     const char *log_path = getenv("WINE_DLL_REDIRECT_LOG");
-    if (log_path && *log_path)
-        g_log = fopen(log_path, "a");
-    real_open_fn = (open_fn)dlsym(RTLD_NEXT, "open");
-    real_open64_fn = (open_fn)dlsym(RTLD_NEXT, "open64");
-    real_openat_fn = (openat_fn)dlsym(RTLD_NEXT, "openat");
-    real_openat64_fn = (openat_fn)dlsym(RTLD_NEXT, "openat64");
-    real_access_fn = (access_fn)dlsym(RTLD_NEXT, "access");
-    real_faccessat_fn = (faccessat_fn)dlsym(RTLD_NEXT, "faccessat");
-    real_stat_fn = (stat_fn)dlsym(RTLD_NEXT, "stat");
-    real_stat64_fn = (stat64_fn)dlsym(RTLD_NEXT, "stat64");
-    real_lstat_fn = (stat_fn)dlsym(RTLD_NEXT, "lstat");
-    real_lstat64_fn = (stat64_fn)dlsym(RTLD_NEXT, "lstat64");
-    real_fstatat_fn = (fstatat_fn)dlsym(RTLD_NEXT, "fstatat");
-    real_newfstatat_fn = (fstatat_fn)dlsym(RTLD_NEXT, "newfstatat");
-    real_xstat_fn = (xstat_fn)dlsym(RTLD_NEXT, "__xstat");
-    real_xstat64_fn = (xstat64_fn)dlsym(RTLD_NEXT, "__xstat64");
-    real_lxstat_fn = (xstat_fn)dlsym(RTLD_NEXT, "__lxstat");
-    real_lxstat64_fn = (xstat64_fn)dlsym(RTLD_NEXT, "__lxstat64");
-    real_syscall_fn = (syscall_fn)dlsym(RTLD_NEXT, "syscall");
+    if (log_path && *log_path && real_open_fn) {
+        int fd = real_open_fn(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        if (fd >= 0)
+            g_log = fdopen(fd, "a");
+    }
+
+    debug_log("init pid=%ld exe=%s trace_open=%d one_shot=%d",
+              (long)getpid(), program_invocation_short_name ? program_invocation_short_name : "(unknown)",
+              g_trace_open ? 1 : 0, g_one_shot ? 1 : 0);
     parse_rules();
     g_initialized = true;
 
@@ -177,8 +240,11 @@ static const char *redirect_path(const char *path)
 
     pthread_mutex_lock(&g_lock);
     for (size_t i = 0; i < g_rule_count; ++i) {
-        if (g_rules[i].used)
+        if (g_rules[i].used) {
+            if (g_trace_open && has_dll_suffix(path, g_rules[i].dll))
+                debug_log("skip already-consumed %s", path);
             continue;
+        }
         if (!has_dll_suffix(path, g_rules[i].dll))
             continue;
         if (strcmp(path, g_rules[i].target) == 0)
@@ -196,7 +262,7 @@ static const char *redirect_path(const char *path)
 
 static void consume_redirect(const char *target)
 {
-    if (!target)
+    if (!target || !g_one_shot)
         return;
 
     pthread_mutex_lock(&g_lock);
@@ -233,6 +299,7 @@ static int call_open_like(open_fn fn, const char *path, int flags, va_list ap)
     if (flags & O_CREAT)
         mode = (mode_t)va_arg(ap, int);
 
+    trace_open_path("open", path);
     const char *actual = redirect_path(path);
     int ret;
     if (flags & O_CREAT)
@@ -250,6 +317,7 @@ static int call_openat_like(openat_fn fn, int dirfd, const char *path, int flags
     if (flags & O_CREAT)
         mode = (mode_t)va_arg(ap, int);
 
+    trace_open_path("openat", path);
     char full_path[PATH_MAX];
     const char *actual = redirect_at_path(dirfd, path, full_path, sizeof(full_path));
     int ret;
@@ -282,6 +350,48 @@ int open64(const char *path, int flags, ...)
     return ret;
 }
 
+int __open_2(const char *path, int flags)
+{
+    init_once();
+    trace_open_path("__open_2", path);
+    const char *actual = redirect_path(path);
+    int ret = real_open_fn(actual, flags);
+    if (ret >= 0 && actual != path)
+        consume_redirect(actual);
+    return ret;
+}
+
+int __open64_2(const char *path, int flags)
+{
+    init_once();
+    trace_open_path("__open64_2", path);
+    const char *actual = redirect_path(path);
+    int ret = (real_open64_fn ? real_open64_fn : real_open_fn)(actual, flags);
+    if (ret >= 0 && actual != path)
+        consume_redirect(actual);
+    return ret;
+}
+
+int __libc_open(const char *path, int flags, ...)
+{
+    init_once();
+    va_list ap;
+    va_start(ap, flags);
+    int ret = call_open_like(real_open_fn, path, flags, ap);
+    va_end(ap);
+    return ret;
+}
+
+int __libc_open64(const char *path, int flags, ...)
+{
+    init_once();
+    va_list ap;
+    va_start(ap, flags);
+    int ret = call_open_like(real_open64_fn ? real_open64_fn : real_open_fn, path, flags, ap);
+    va_end(ap);
+    return ret;
+}
+
 int openat(int dirfd, const char *path, int flags, ...)
 {
     init_once();
@@ -302,15 +412,39 @@ int openat64(int dirfd, const char *path, int flags, ...)
     return ret;
 }
 
+FILE *fopen(const char *path, const char *mode)
+{
+    init_once();
+    trace_open_path("fopen", path);
+    const char *actual = redirect_path(path);
+    FILE *ret = real_fopen_fn(actual, mode);
+    if (ret && actual != path)
+        consume_redirect(actual);
+    return ret;
+}
+
+FILE *fopen64(const char *path, const char *mode)
+{
+    init_once();
+    trace_open_path("fopen64", path);
+    const char *actual = redirect_path(path);
+    FILE *ret = (real_fopen64_fn ? real_fopen64_fn : real_fopen_fn)(actual, mode);
+    if (ret && actual != path)
+        consume_redirect(actual);
+    return ret;
+}
+
 int access(const char *path, int mode)
 {
     init_once();
+    trace_open_path("access", path);
     return real_access_fn(redirect_path(path), mode);
 }
 
 int faccessat(int dirfd, const char *path, int mode, int flags)
 {
     init_once();
+    trace_open_path("faccessat", path);
     char full_path[PATH_MAX];
     const char *actual = redirect_at_path(dirfd, path, full_path, sizeof(full_path));
     return real_faccessat_fn(is_absolute_path(actual) ? AT_FDCWD : dirfd, actual, mode, flags);
@@ -319,30 +453,35 @@ int faccessat(int dirfd, const char *path, int mode, int flags)
 int stat(const char *path, struct stat *buf)
 {
     init_once();
+    trace_open_path("stat", path);
     return real_stat_fn(redirect_path(path), buf);
 }
 
 int stat64(const char *path, struct stat64 *buf)
 {
     init_once();
+    trace_open_path("stat64", path);
     return real_stat64_fn(redirect_path(path), buf);
 }
 
 int lstat(const char *path, struct stat *buf)
 {
     init_once();
+    trace_open_path("lstat", path);
     return real_lstat_fn(redirect_path(path), buf);
 }
 
 int lstat64(const char *path, struct stat64 *buf)
 {
     init_once();
+    trace_open_path("lstat64", path);
     return real_lstat64_fn(redirect_path(path), buf);
 }
 
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
 {
     init_once();
+    trace_open_path("fstatat", path);
     char full_path[PATH_MAX];
     const char *actual = redirect_at_path(dirfd, path, full_path, sizeof(full_path));
     fstatat_fn fn = real_fstatat_fn ? real_fstatat_fn : real_newfstatat_fn;
@@ -352,6 +491,7 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
 int newfstatat(int dirfd, const char *path, struct stat *buf, int flags)
 {
     init_once();
+    trace_open_path("newfstatat", path);
     char full_path[PATH_MAX];
     const char *actual = redirect_at_path(dirfd, path, full_path, sizeof(full_path));
     fstatat_fn fn = real_newfstatat_fn ? real_newfstatat_fn : real_fstatat_fn;
@@ -361,24 +501,28 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags)
 int __xstat(int ver, const char *path, struct stat *buf)
 {
     init_once();
+    trace_open_path("__xstat", path);
     return real_xstat_fn(ver, redirect_path(path), buf);
 }
 
 int __xstat64(int ver, const char *path, struct stat64 *buf)
 {
     init_once();
+    trace_open_path("__xstat64", path);
     return real_xstat64_fn(ver, redirect_path(path), buf);
 }
 
 int __lxstat(int ver, const char *path, struct stat *buf)
 {
     init_once();
+    trace_open_path("__lxstat", path);
     return real_lxstat_fn(ver, redirect_path(path), buf);
 }
 
 int __lxstat64(int ver, const char *path, struct stat64 *buf)
 {
     init_once();
+    trace_open_path("__lxstat64", path);
     return real_lxstat64_fn(ver, redirect_path(path), buf);
 }
 

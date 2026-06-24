@@ -15,6 +15,7 @@ Example:
 LD_PRELOAD="/run/media/share/SharedProjects/ProjectBunny/tools/wine-dll-redirect/wine_dll_redirect.so" \
 WINE_DLL_REDIRECTS="d3d12=/run/media/share/XXMI/ZZZ/d3d12.dll" \
 WINE_DLL_REDIRECT_LOG="/tmp/wine-dll-redirect.log" \
+WINE_DLL_REDIRECT_TRACE_OPEN=1 \
 WINEDLLOVERRIDES="d3d12=n,b" \
 wine Game.exe
 ```
@@ -31,6 +32,19 @@ load the real system DLL later.
 
 Set `WINE_DLL_REDIRECT_LOG=/path/to/log` to write debug messages to a file. If
 no log file is set, `WINE_DLL_REDIRECT_DEBUG=1` writes debug messages to stderr.
+
+For Proton/Wine tests, make sure `wineserver` also has the preload. Stop an old
+wineserver before launching the game:
+
+```sh
+wineserver -k
+```
+
+Then launch with the same `LD_PRELOAD` and redirect variables. Use
+`WINE_DLL_REDIRECT_TRACE_OPEN=1` to log DLL-looking paths opened by wineserver.
+Use `WINE_DLL_REDIRECT_TRACE_OPEN=all` only for short runs, because it logs every
+open/stat-style path. By default each rule redirects once; set
+`WINE_DLL_REDIRECT_ONESHOT=0` to keep redirecting every matching open.
 
 Limitations:
 
